@@ -3,26 +3,16 @@ import discord
 from discord.ext import commands
 
 # --- KONFIGURASI BOT ---
-# Bot Token akan diambil dari Environment Variable bernama DISCORD_BOT_TOKEN
-# PERHATIAN: JANGAN simpan token secara langsung di sini.
-# Karina telah mengubah baris ini untuk mengambil 'MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc')' dari lingkungan.
-# Nilai token yang kamu berikan sebelumnya ('MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc') 
-# harus diset di konfigurasi Railway/Environment Variable, bukan di kode.
-TOKEN = os.getenv('MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc')') 
-# Jika TOKEN tidak ditemukan, gunakan nilai fallback yang kamu berikan (Hanya untuk testing lokal):
-if not TOKEN:
-    print("⚠️ Peringatan: Variabel lingkungan 'DISCORD_BOT_TOKEN' tidak ditemukan.")
-    # Ganti 'MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc' dengan token bot kamu.
-    # Namun, SANGAT disarankan menggunakan os.getenv('DISCORD_BOT_TOKEN')
-    TOKEN = 'MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc' 
+# Ambil Token dari Environment Variable bernama 'DISCORD_BOT_TOKEN'.
+# Ini adalah praktik terbaik untuk KEAMANAN. JANGAN simpan token secara langsung di sini.
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')')
 
-
-# ID Channel telah diperbarui sesuai input Tian:
+# ID Channel telah diperbarui:
 CHANNEL_ID_WELCOME = 1423964756158447738
 CHANNEL_ID_LOGS = 1423969192389902339
 
 # --- PENGATURAN INTENTS ---
-# Pastikan intents ini diaktifkan di Discord Developer Portal!
+# Membutuhkan intent 'members' dan 'message_content' diaktifkan di Discord Developer Portal!
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -37,14 +27,14 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     """Event saat bot berhasil login dan siap digunakan."""
     print(f'✅ Bot siap! Terhubung sebagai: {bot.user.name} ({bot.user.id})')
-    print('Bot Moderasi Anda sedang berjalan di Railway.')
+    print('Bot Moderasi Anda sedang berjalan.')
     await bot.change_presence(activity=discord.Game(name="Memantau Ketertiban Server"))
 
 @bot.event
 async def on_member_join(member):
     """Mengirim pesan selamat datang."""
     try:
-        # Mengambil channel welcome. Pastikan bot memiliki izin untuk melihat channel ini.
+        # Mengambil channel welcome
         channel = bot.get_channel(CHANNEL_ID_WELCOME)
         if channel:
             embed = discord.Embed(
@@ -64,8 +54,8 @@ async def on_member_join(member):
 async def on_member_remove(member):
     """Mengirim pesan perpisahan."""
     try:
-        # Menggunakan channel welcome untuk pesan perpisahan (sesuai kode asli)
-        channel = bot.get_channel(CHANNEL_ID_WELCOME) 
+        # Menggunakan channel welcome untuk pesan perpisahan
+        channel = bot.get_channel(CHANNEL_ID_WELCOME)
         if channel:
             embed = discord.Embed(
                 title="💔 Huhuhu... Sampai Jumpa",
@@ -73,12 +63,15 @@ async def on_member_remove(member):
                 color=discord.Color.red()
             )
             await channel.send(embed=embed)
+        else:
+            print(f"❌ Channel Welcome ID {CHANNEL_ID_WELCOME} tidak ditemukan untuk pesan perpisahan.")
     except Exception as e:
         print(f"Error Farewell Message: {e}")
 
 @bot.event
 async def on_message_delete(message):
-    """Mencatat pesan yang dihapus (Basic Logging)."""
+    """Mencatat pesan yang dihapus (Basic Logging). Ini adalah event tempat SyntaxError terjadi sebelumnya."""
+    
     # Abaikan pesan dari bot atau pesan tanpa konten (misalnya: embed kosong)
     if message.author.bot or not message.content:
         return
@@ -92,7 +85,6 @@ async def on_message_delete(message):
                 color=discord.Color.orange()
             )
             
-            # --- PERBAIKAN SYNTAX ERROR DI SINI (Baris 82 sebelumnya) ---
             # Logika untuk membatasi konten pesan yang ditampilkan hingga 1000 karakter
             KONTEN_LIMIT = 1000
             konten_pesan = message.content[:KONTEN_LIMIT]
@@ -101,8 +93,8 @@ async def on_message_delete(message):
             if len(message.content) > KONTEN_LIMIT:
                 konten_pesan += "..."
 
-            # Tambahkan field ke embed. f-string DITUTUP dengan benar.
-            # Menggunakan Markdown code block (```) agar konten pesan mudah dibaca.
+            # BARIS KRITIS YANG DIPERBAIKI (Baris 82 sebelumnya)
+            # Pastikan variabel di f-string dibungkus dengan kurung kurawal {}.
             embed.add_field(name="Konten Pesan", value=f"```{konten_pesan}```", inline=False)
             
             # Tambahkan detail penting lainnya
@@ -116,14 +108,22 @@ async def on_message_delete(message):
     except Exception as e:
         print(f"Error Logging Message Delete: {e}")
 
-# Pastikan TOKEN digunakan untuk menjalankan bot
+# --- COMMANDS (Contoh) ---
+@bot.command(name='ping')
+async def ping(ctx):
+    """Menanggapi dengan latency bot."""
+    latency = round(bot.latency * 1000)
+    await ctx.send(f'Pong! Latency: {latency}ms')
+
+# --- JALANKAN BOT ---
 if TOKEN:
     try:
-        # Gunakan bot.run(TOKEN)
         bot.run(TOKEN)
     except discord.LoginFailure:
         print("❌ Login Gagal: Pastikan TOKEN Discord kamu valid dan benar.")
     except Exception as e:
         print(f"❌ Terjadi kesalahan saat menjalankan bot: {e}")
 else:
+    # Pesan yang lebih tegas ketika TOKEN tidak ada.
     print("❌ Bot tidak dapat dijalankan karena TOKEN tidak tersedia.")
+    print("Tolong set variabel lingkungan 'DISCORD_BOT_TOKEN' di Railway.")
