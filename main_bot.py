@@ -8,7 +8,7 @@ from discord.ext import commands
 # Karina telah mengubah baris ini untuk mengambil 'MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc')' dari lingkungan.
 # Nilai token yang kamu berikan sebelumnya ('MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc') 
 # harus diset di konfigurasi Railway/Environment Variable, bukan di kode.
-TOKEN = os.getenv('DISCORD_BOT_TOKEN') 
+TOKEN = os.getenv('MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc')') 
 # Jika TOKEN tidak ditemukan, gunakan nilai fallback yang kamu berikan (Hanya untuk testing lokal):
 if not TOKEN:
     print("⚠️ Peringatan: Variabel lingkungan 'DISCORD_BOT_TOKEN' tidak ditemukan.")
