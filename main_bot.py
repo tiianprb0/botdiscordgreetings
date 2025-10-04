@@ -6,8 +6,8 @@ from discord.ext import commands
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # ID channel untuk welcome dan logs
-CHANNEL_ID_WELCOME = 123456789012345678  # ganti dengan ID channel welcome
-CHANNEL_ID_LOGS = 987654321098765432    # ganti dengan ID channel logs
+CHANNEL_ID_WELCOME = 1423964756158447738  # ganti dengan ID channel welcome
+CHANNEL_ID_LOGS = 1423969192389902339    # ganti dengan ID channel logs
 
 # Intents
 intents = discord.Intents.default()
