@@ -1,123 +1,98 @@
+import os
 import discord
 from discord.ext import commands
 
-# --- KONFIGURASI BOT (HARDCODED) ---
-# PERHATIAN: MENYIMPAN TOKEN DI KODE BERSIFAT SANGAT TIDAK AMAN.
-# Segera ganti praktik ini dengan os.getenv('DISCORD_BOT_TOKEN') setelah berhasil.
-TOKEN = 'MTQyMzk4MDMxODQ5NDI5NDAzNg.GTfjMg.n0JNshPpbMwaWfcOmJSivOHdvjaCgmKx4tPHCc'
+# Ambil token dari environment variable (Railway → Variables)
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# ID Channel (Disesuaikan dengan input Tian)
-CHANNEL_ID_WELCOME = 1423964756158447738
-CHANNEL_ID_LOGS = 1423969192389902339
+# ID channel untuk welcome dan logs
+CHANNEL_ID_WELCOME = 123456789012345678  # ganti dengan ID channel welcome
+CHANNEL_ID_LOGS = 987654321098765432    # ganti dengan ID channel logs
 
-# --- PENGATURAN INTENTS ---
-# Membutuhkan intent 'members' dan 'message_content' diaktifkan di Discord Developer Portal!
+# Intents
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
 intents.guilds = True
+intents.message_content = True
 
-# Inisialisasi Bot
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- EVENT UTAMA ---
+KONTEN_LIMIT = 1000
 
 @bot.event
 async def on_ready():
-    """Event saat bot berhasil login dan siap digunakan."""
-    print(f'✅ Bot siap! Terhubung sebagai: {bot.user.name} ({bot.user.id})')
-    print('Bot Moderasi Anda sedang berjalan di Railway.')
-    await bot.change_presence(activity=discord.Game(name="Memantau Ketertiban Server"))
+    print(f"Bot sudah login sebagai {bot.user}")
+    await bot.change_presence(
+        activity=discord.Game("menjaga server ✨")
+    )
 
 @bot.event
 async def on_member_join(member):
-    """Mengirim pesan selamat datang."""
     try:
-        # Mengambil channel welcome
         channel = bot.get_channel(CHANNEL_ID_WELCOME)
         if channel:
             embed = discord.Embed(
-                title="👋 Selamat Datang di EternalLights!",
-                description=f"Hola, **{member.display_name}**! Jangan lupa baca #rules.",
+                title="🎉 Selamat Datang!",
+                description=f"Halo {member.mention}, selamat bergabung di {member.guild.name}!",
                 color=discord.Color.green()
             )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            embed.set_footer(text=f"Anggota ke-{member.guild.member_count}")
             await channel.send(embed=embed)
-        else:
-            print(f"❌ Channel Welcome ID {CHANNEL_ID_WELCOME} tidak ditemukan.")
     except Exception as e:
-        print(f"Error Welcome Message: {e}")
+        print(f"Error on_member_join: {e}")
 
 @bot.event
 async def on_member_remove(member):
-    """Mengirim pesan perpisahan."""
     try:
         channel = bot.get_channel(CHANNEL_ID_WELCOME)
         if channel:
             embed = discord.Embed(
-                title="💔 Huhuhu... Sampai Jumpa",
-                description=f"Anggota **{member.display_name}** telah meninggalkan server.",
+                title="👋 Selamat Tinggal",
+                description=f"{member.display_name} telah keluar dari server.",
                 color=discord.Color.red()
             )
             await channel.send(embed=embed)
     except Exception as e:
-        print(f"Error Farewell Message: {e}")
+        print(f"Error on_member_remove: {e}")
 
 @bot.event
 async def on_message_delete(message):
-    """Mencatat pesan yang dihapus (Basic Logging). Syntax error sebelumnya sudah diperbaiki di sini."""
-    
-    # Abaikan pesan dari bot atau pesan tanpa konten
-    if message.author.bot or not message.content:
-        return
-
     try:
+        if message.author.bot:
+            return
+
         log_channel = bot.get_channel(CHANNEL_ID_LOGS)
-        if log_channel:
-            embed = discord.Embed(
-                title="🗑️ Pesan Dihapus",
-                description=f"Pesan yang dikirim oleh {message.author.mention} dihapus di {message.channel.mention}.",
-                color=discord.Color.orange()
-            )
-            
-            # Logika untuk membatasi konten pesan
-            KONTEN_LIMIT = 1000
-            konten_pesan = message.content[:KONTEN_LIMIT]
-            
-            # Tambahkan elipsis jika pesan dipotong
-            if len(message.content) > KONTEN_LIMIT:
-                konten_pesan += "..."
+        if not log_channel:
+            return
 
-            # BARIS KRITIS YANG DIREVISI: Menghapus triple backtick (```)
-            # Nilai pesan sekarang dimasukkan langsung tanpa format code block Discord.
-            embed.add_field(name="Konten Pesan", value=konten_pesan, inline=False)
-            
-            # Tambahkan detail penting lainnya
-            embed.set_footer(text=f"ID Pengguna: {message.author.id} | ID Pesan: {message.id}")
-            embed.timestamp = message.created_at # Waktu asli pesan dibuat
+        konten_pesan = (message.content or "")[:KONTEN_LIMIT]
+        if len(message.content or "") > KONTEN_LIMIT:
+            konten_pesan += "..."
+        konten_pesan = konten_pesan.replace("```", "")
 
-            await log_channel.send(embed=embed)
-        else:
-            print(f"❌ Channel Logs ID {CHANNEL_ID_LOGS} tidak ditemukan.")
-            
+        embed = discord.Embed(
+            title="🗑️ Pesan Dihapus",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Pengirim", value=message.author.mention, inline=False)
+        embed.add_field(name="Channel", value=message.channel.mention, inline=False)
+        embed.add_field(name="Konten Pesan", value="```" + konten_pesan + "```", inline=False)
+
+        await log_channel.send(embed=embed)
     except Exception as e:
-        print(f"Error Logging Message Delete: {e}")
+        print(f"Error on_message_delete: {e}")
 
-# --- COMMANDS (Contoh) ---
-@bot.command(name='ping')
+@bot.command()
 async def ping(ctx):
-    """Menanggapi dengan latency bot."""
-    latency = round(bot.latency * 1000)
-    await ctx.send(f'Pong! Latency: {latency}ms')
+    await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
 
-# --- JALANKAN BOT ---
-if TOKEN:
-    try:
-        bot.run(TOKEN)
-    except discord.LoginFailure:
-        print("❌ Login Gagal: Pastikan TOKEN Discord kamu valid dan benar. (Periksa kembali token yang di-hardcode)")
-    except Exception as e:
-        print(f"❌ Terjadi kesalahan saat menjalankan bot: {e}")
-else:
-    print("❌ Bot tidak dapat dijalankan karena TOKEN tidak tersedia.")
+# Jalankan bot
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ Token tidak ditemukan. Set environment variable DISCORD_BOT_TOKEN di Railway!")
+    else:
+        try:
+            bot.run(TOKEN)
+        except discord.LoginFailure:
+            print("❌ Token invalid. Pastikan DISCORD_BOT_TOKEN benar.")
+        except Exception as e:
+            print(f"Error menjalankan bot: {e}")
