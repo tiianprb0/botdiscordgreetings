@@ -89,8 +89,9 @@ async def on_message_delete(message):
             if len(message.content) > KONTEN_LIMIT:
                 konten_pesan += "..."
 
-            # KOREKSI SINTAKS F-STRING: Variabel {konten_pesan} sudah dibungkus kurawal dengan benar
-            embed.add_field(name="Konten Pesan", value=f"```{konten_pesan}```", inline=False)
+            # BARIS KRITIS YANG DIREVISI: Menghapus triple backtick (```)
+            # Nilai pesan sekarang dimasukkan langsung tanpa format code block Discord.
+            embed.add_field(name="Konten Pesan", value=konten_pesan, inline=False)
             
             # Tambahkan detail penting lainnya
             embed.set_footer(text=f"ID Pengguna: {message.author.id} | ID Pesan: {message.id}")
