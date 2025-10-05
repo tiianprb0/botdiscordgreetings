@@ -33,14 +33,15 @@ except Exception as e:
     raise
 
 # =========================
-# KONFIGURASI DISCORD
+# KONFIG DISCORD
 # =========================
-CHANNEL_ID_WELCOME = 1423964756158447738
-CHANNEL_ID_LOGS    = 1423969192389902339
-CHANNEL_ID_MABAR   = 1424029336683679794
-CHANNEL_ID_INTRO   = 1424033383339659334
-RULES_CHANNEL_ID   = 1423969192389902336
-ROLE_ID_LIGHT      = 1424026593143164958
+CHANNEL_ID_WELCOME     = 1423964756158447738
+CHANNEL_ID_LOGS        = 1423969192389902339
+CHANNEL_ID_MABAR       = 1424029336683679794
+CHANNEL_ID_INTRO       = 1424033383339659334
+RULES_CHANNEL_ID       = 1423969192389902336
+ROLE_ID_LIGHT          = 1424026593143164958
+CHANNEL_ID_PHOTO_MEDIA = 1424033929874247802  # <- tujuan forward foto
 
 REACTION_EMOJI = "🔆"
 
@@ -63,7 +64,6 @@ def now_wib() -> datetime:
     return datetime.now(TZ)
 
 def to_epoch(dt: datetime) -> float:
-    """Pastikan aware (UTC) lalu ke epoch detik."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
     return dt.astimezone(timezone.utc).timestamp()
@@ -145,15 +145,12 @@ def update_mabar_status(doc_id: str, **fields):
         print("[WARN] Gagal update mabar_reminders:", e)
 
 def load_pending_mabar(now_epoch: float):
-    """Ambil semua reminder yang status 'scheduled' dan belum lewat 1.5 jam dari waktu target."""
     try:
         q = db.collection(MABAR_COL).where("status", "==", "scheduled").stream()
         items = []
         for d in q:
             dat = d.to_dict()
-            # Pastikan minimal field
             if "remind_at_epoch" in dat and "guild_id" in dat and "channel_id" in dat and "map_name" in dat:
-                # Kalau remind_at masih di masa depan, atau baru lewat < 5400 detik (1.5 jam), tetap jadwalkan auto-delete
                 if dat["remind_at_epoch"] + 5400 > now_epoch:
                     items.append((d.id, dat))
         return items
@@ -172,7 +169,7 @@ async def on_ready():
     except Exception:
         pass
 
-    # Resume semua mabar reminder yang masih 'scheduled'
+    # Resume semua mabar reminder yg masih 'scheduled'
     pending = load_pending_mabar(to_epoch(now_wib()))
     if pending:
         print(f"⏲️ Menjadwalkan ulang {len(pending)} reminder mabar dari Firestore.")
@@ -216,7 +213,6 @@ async def on_member_join(member: discord.Member):
 
     await save_welcome_message(member.id, msg.id)
 
-    # Auto-cleanup 24 jam jika user tidak bertindak
     async def autodelete_welcome():
         await asyncio.sleep(24 * 3600)
         stored_id = await get_welcome_message(member.id)
@@ -231,7 +227,6 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # Bersihkan mapping bila masih ada
     await delete_welcome_message(member.id)
     ch = bot.get_channel(CHANNEL_ID_WELCOME)
     if not isinstance(ch, discord.TextChannel):
@@ -284,8 +279,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             intro_channel = guild.get_channel(CHANNEL_ID_INTRO)
             if isinstance(intro_channel, discord.TextChannel):
                 await intro_channel.send(
-                    f"Ekhem… {member.mention}! Sebutin umurmu aja boleh kok. "
-                    f"Kalau mau cerita lebih, juga boleh, tapi jangan terlalu detail, ya!"
+                    f"Ekhem… {member.mention}! Sebutin umur kamu aja boleh kok. "
+                    f"Kalau mau cerita lebih, juga boleh, ngga perlu terlalu detail, ya!"
                 )
         else:
             await member.remove_roles(role, reason="Welcome reaction role: Light (remove)")
@@ -293,7 +288,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         print("[ERROR] Gagal toggle role:", e)
         return
 
-    # Edit footer + hapus setelah 8 detik
     try:
         if isinstance(channel, discord.TextChannel):
             msg = await channel.fetch_message(target_msg_id)
@@ -333,13 +327,125 @@ async def on_message_delete(message: discord.Message):
     await log_channel.send(embed=embed)
 
 # =========================
-# COMMAND ROUTING
+# DETEKSI GAMBAR & FORWARD DGN KONFIRMASI
+# =========================
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+def _is_image_attachment(att: discord.Attachment) -> bool:
+    ct = (att.content_type or "").lower()
+    if ct.startswith("image/"):
+        return True
+    name = (att.filename or "").lower()
+    return any(name.endswith(ext) for ext in IMAGE_EXTS)
+
+def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+async def _confirm_and_forward_images(message: discord.Message):
+    """Konfirmasi  ✅/❌ lalu forward gambar; auto-hapus prompt 30 detik."""
+    if not message.guild or not message.attachments:
+        return
+
+    images = [att for att in message.attachments if _is_image_attachment(att)]
+    if not images:
+        return
+
+    prompt = await message.channel.send(
+        f"hola {message.author.mention}, apakah kamu ingin foto nya aku forward ke **Channel Photo-Media**?"
+    )
+    # Auto-hapus prompt dalam 30 detik bila tidak ada aksi
+    async def prompt_timeout_cleanup():
+        await asyncio.sleep(30)
+        try:
+            await prompt.delete()
+        except Exception:
+            pass
+    timeout_task = asyncio.create_task(prompt_timeout_cleanup())
+
+    try:
+        await prompt.add_reaction("✅")
+        await prompt.add_reaction("❌")
+    except Exception:
+        pass
+
+    def check(reaction, user):
+        return (
+            user == message.author
+            and str(reaction.emoji) in ["✅", "❌"]
+            and reaction.message.id == prompt.id
+        )
+
+    decided = False
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+        decided = True
+    except asyncio.TimeoutError:
+        # timeout -> prompt akan dihapus oleh timeout_task
+        await message.channel.send("⏰ Konfirmasi habis. Forward dibatalkan.", delete_after=6)
+        return
+
+    if decided:
+        # Hapus prompt secepatnya
+        try:
+            timeout_task.cancel()
+        except Exception:
+            pass
+        try:
+            await prompt.delete()
+        except Exception:
+            pass
+
+    if str(reaction.emoji) == "❌":
+        await message.channel.send("❌ Oke, tidak di-forward.", delete_after=5)
+        return
+
+    # ✅ Forward
+    try:
+        dest = bot.get_channel(CHANNEL_ID_PHOTO_MEDIA)
+        if not isinstance(dest, discord.TextChannel):
+            await message.channel.send("⚠️ Channel Photo-Media tidak ditemukan.", delete_after=6)
+            return
+
+        caption = message.clean_content.strip()
+        prefix = f"media dari {message.author.mention}"
+        content = f"{prefix}\n{caption}" if caption else prefix
+
+        files = []
+        for att in images[:10]:
+            try:
+                files.append(await att.to_file())
+            except Exception as e:
+                print("[WARN] Gagal mengambil attachment:", e)
+
+        # kirim ke photo-media
+        sent = None
+        if files:
+            sent = await dest.send(content=content, files=files)
+        else:
+            sent = await dest.send(content)
+
+        # kasih info di channel asal dengan link ke pesan tujuan
+        jump = _jump_url(message.guild.id, dest.id, sent.id) if sent else ""
+        await message.channel.send(
+            f"Ekhem.. media {message.author.mention} udah aku forward ke "
+            f"[Media Photo]({jump}), cuss lihat~",
+            suppress_embeds=True,
+            delete_after=10
+        )
+
+    except Exception as e:
+        print("[ERROR] Gagal forward foto:", e)
+        await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
+
+# =========================
+# COMMAND ROUTING + HOOKS
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # 1) Deteksi !mabar / !main manual
     content = message.content.lower()
     match_cmd = re.search(r'!(mabar|main)\s+(.+)', content)
     if match_cmd:
@@ -348,6 +454,13 @@ async def on_message(message: discord.Message):
         await mabar(ctx, arg=arg)
         return
 
+    # 2) Deteksi gambar + konfirmasi forward
+    try:
+        await _confirm_and_forward_images(message)
+    except Exception as e:
+        print("[WARN] Handler forward images error:", e)
+
+    # 3) Proses commands biasa
     await bot.process_commands(message)
 
 # =========================
@@ -359,18 +472,11 @@ async def ping(ctx: commands.Context):
 
 # ---------- MABAR ----------
 async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
-    """
-    Menjadwalkan reminder & auto-delete berdasarkan dokumen Firestore.
-    dat: {
-      guild_id, channel_id, map_name, role_id, announce_message_id (optional),
-      remind_at_epoch, created_by_id, status
-    }
-    """
     try:
         remind_at_epoch = float(dat["remind_at_epoch"])
-        channel_id = int(dat["channel_id"])
-        map_name = str(dat["map_name"])
-        role_id = int(dat.get("role_id", ROLE_ID_LIGHT))
+        channel_id      = int(dat["channel_id"])
+        map_name        = str(dat["map_name"])
+        role_id         = int(dat.get("role_id", ROLE_ID_LIGHT))
         announce_msg_id = int(dat.get("announce_message_id", 0))
     except Exception as e:
         print("[WARN] Dokumen mabar invalid:", e, dat)
@@ -384,7 +490,6 @@ async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
 
     role_mention = f"<@&{role_id}>"
 
-    # Reminder task
     async def remind_task():
         delay = max(0, (remind_at_dt - now_wib()).total_seconds())
         if delay > 60:
@@ -395,7 +500,6 @@ async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
         except Exception as e:
             print("[ERROR] Reminder gagal:", e)
 
-    # Auto delete pengumuman 1 jam setelah remind_at
     async def autodelete_task():
         total = max(0, (remind_at_dt - now_wib()).total_seconds()) + 3600
         await asyncio.sleep(total)
@@ -403,8 +507,7 @@ async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
             try:
                 msg = await ch.fetch_message(announce_msg_id)
                 await msg.delete()
-            except Exception as e:
-                # 404: already gone
+            except Exception:
                 pass
         update_mabar_status(doc_id, status="done")
 
@@ -496,7 +599,7 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
 
     await ctx.send(f"✅ Pengumuman mabar dikirim ke <#{CHANNEL_ID_MABAR}>", delete_after=5)
 
-    # Simpan jadwal ke Firestore & jadwalkan task
+    # Simpan jadwal & jadwalkan task
     doc_id = f"{ctx.guild.id}-{announce_msg.id}"
     data = {
         "status": "scheduled",
@@ -507,7 +610,7 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
         "announce_message_id": announce_msg.id,
         "created_by_id": ctx.author.id,
         "created_at": firestore.SERVER_TIMESTAMP,
-        "remind_at_epoch": to_epoch(remind_at),  # UTC epoch
+        "remind_at_epoch": to_epoch(remind_at),
         "remind_at_wib": remind_at.strftime("%Y-%m-%d %H:%M:%S WIB"),
     }
     save_mabar_schedule(doc_id, data)
