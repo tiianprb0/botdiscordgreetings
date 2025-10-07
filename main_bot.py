@@ -41,18 +41,18 @@ except Exception as e:
 # =========================
 # KONFIG DISCORD / ID
 # =========================
-CHANNEL_ID_WELCOME        = 1423964756158447738
-CHANNEL_ID_LOGS           = 1423969192389902339    # moderator/log channel
-CHANNEL_ID_MABAR          = 1424029336683679794
-CHANNEL_ID_INTRO          = 1424033383339659334
-RULES_CHANNEL_ID          = 1423969192389902336
-ROLE_ID_LIGHT             = 1424026593143164958
-CHANNEL_ID_PHOTO_MEDIA    = 1424033929874247802    # forward foto/ gambar
-CHANNEL_ID_DOWNLOADER     = 1425023771185774612    # channel downloader
-CHANNEL_ID_LINK_DETECT    = 1424032583519567952    # deteksi link → arahkan ke downloader
-CHANNEL_ID_SERVER_SPOTLIGHT = 1425015637197066260  # tujuan announce
+CHANNEL_ID_WELCOME          = 1423964756158447738
+CHANNEL_ID_LOGS             = 1423969192389902339    # moderator/log channel
+CHANNEL_ID_MABAR            = 1424029336683679794
+CHANNEL_ID_INTRO            = 1424033383339659334
+RULES_CHANNEL_ID            = 1423969192389902336
+ROLE_ID_LIGHT               = 1424026593143164958
+CHANNEL_ID_PHOTO_MEDIA      = 1424033929874247802    # forward foto/ gambar
+CHANNEL_ID_DOWNLOADER       = 1425023771185774612    # channel downloader
+CHANNEL_ID_LINK_DETECT      = 1424032583519567952    # deteksi link → arahkan ke downloader
+CHANNEL_ID_SERVER_SPOTLIGHT = 1425015637197066260    # tujuan announce
 
-REACTION_EMOJI            = "🔆"
+REACTION_EMOJI = "🔆"
 TZ = ZoneInfo("Asia/Jakarta")
 
 intents = discord.Intents.default()
@@ -246,16 +246,20 @@ async def ensure_downloader_notice():
             pass
     enabled = get_downloader_enabled(gid)
     status_bullet = "🟢" if enabled else "🔴"
+
+    # Teks pemberitahuan persis sesuai brief (menggunakan "!dw" sebagai copy)
+    desc = (
+        "Cukup !dw untuk mulai men-download —\n"
+        "bot akan otomatis membuat **thread pribadi** khusus untukmu 🤫\n"
+        "(hanya kamu dan bot yang dapat melihat percakapan tersebut).\n\n"
+        "📦 **Maksimum ukuran media: 25 MB**\n"
+        "Lebih dari itu, bot akan mengirimkan tautan unduhan.\n"
+        f"| {status_bullet} Fitur ini aktif untuk member dengan role 🔆 Light."
+    )
+
     embed = discord.Embed(
         title="Downloader Center",
-        description=(
-            "Untuk menjaga privasi, mulailah dengan perintah **`!dw`** di sini.\n"
-            "Bot akan membuat **thread privat** khusus untukmu 🤫\n"
-            "*(Hanya kamu dan bot yang dapat melihat percakapan tersebut.)*\n\n"
-            "📦 **Maksimum ukuran media:** 25 MB\n"
-            "Lebih dari itu, bot akan mengirimkan **tautan unduhan**.\n\n"
-            f"| {status_bullet} Fitur ini aktif untuk member dengan role 🔆 Light."
-        ),
+        description=desc,
         color=discord.Color.blurple()
     )
     msg = await ch.send(embed=embed)
@@ -480,9 +484,10 @@ async def _confirm_and_forward_images(message: discord.Message):
         await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
 
 # =========================
-# DOWNLOADER (API: dl.siputzx.my.id)
+# DOWNLOADER (API: dl.siputzx.my.id) + CAROUSEL IG
 # =========================
 class DlActionView(discord.ui.View):
+    # Discord tidak mendukung warna custom tombol; pakai emoji nuansa pink 🌸
     def __init__(self, thread: discord.Thread, author_id: int):
         super().__init__(timeout=300)
         self.thread = thread
@@ -494,14 +499,14 @@ class DlActionView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Download lagi", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🌸 Download lagi", style=discord.ButtonStyle.primary)
     async def again(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "Kirim tautan sosial (IG/TikTok/dll) di thread ini ya. Aman; hanya kamu & bot yang bisa melihat.",
             ephemeral=True
         )
 
-    @discord.ui.button(label="Tutup thread", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="🌸 Tutup thread", style=discord.ButtonStyle.secondary)
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await self.thread.edit(archived=True, locked=True)
@@ -522,18 +527,18 @@ def _build_dl_headers() -> dict:
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        # UA opsional; bisa ditambah kalau perlu
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/127.0.0.1 Safari/537.36"
         ),
+        "Referer": "https://dl.siputzx.my.id/",
     }
 
-def _post_siputzx(link: str) -> Tuple[Optional[str], Optional[str]]:
+def _post_siputzx(link: str) -> Tuple[Optional[dict], Optional[str]]:
     """
-    Panggil API https://dl.siputzx.my.id/ (POST JSON) sesuai brief.
-    Return: (tunnel_url, filename) atau (None, None)
+    Panggil API https://dl.siputzx.my.id/ (POST JSON).
+    Return: (json_dict, errstr)
     """
     try:
         resp = requests.post(
@@ -547,20 +552,15 @@ def _post_siputzx(link: str) -> Tuple[Optional[str], Optional[str]]:
             timeout=30
         )
         if resp.status_code != 200:
-            print("[siputzx] status:", resp.status_code, resp.text[:200])
-            return None, None
+            return None, f"HTTP {resp.status_code}"
         data = resp.json()
-        tunnel = data.get("url")
-        filename = data.get("filename") or "media.mp4"
-        if isinstance(tunnel, str) and tunnel.startswith("http"):
-            return tunnel, filename
+        return data, None
     except Exception as e:
-        print("[siputzx] exception:", e)
-    return None, None
+        return None, str(e)
 
 async def download_to_bytes(session: aiohttp.ClientSession, url: str, max_bytes: int) -> Tuple[Optional[bytes], bool]:
     try:
-        async with session.get(url, headers=_build_dl_headers(), timeout=aiohttp.ClientTimeout(total=45)) as r:
+        async with session.get(url, headers=_build_dl_headers(), timeout=aiohttp.ClientTimeout(total=60)) as r:
             if r.status != 200:
                 print("[download] status:", r.status)
                 return None, True
@@ -579,30 +579,64 @@ async def download_to_bytes(session: aiohttp.ClientSession, url: str, max_bytes:
         print("[download] exception:", e)
         return None, True
 
-async def process_download_in_thread(thread: discord.Thread, author: discord.Member, link: str):
-    await thread.send("⏳ Tunggu sebentar, aku ambil medianya…")
-
-    tunnel_url, filename = _post_siputzx(link)
-    if not tunnel_url:
-        await thread.send("❌ Gagal mengambil media dari tautan itu. Coba tautan lain, ya.", view=DlActionView(thread, author.id))
-        return
-
+async def _send_file_or_link(thread: discord.Thread, author: discord.Member, url: str, filename: str):
     async with aiohttp.ClientSession() as session:
-        content, oversize_or_fail = await download_to_bytes(session, tunnel_url, MAX_UPLOAD_BYTES)
-
+        content, oversize_or_fail = await download_to_bytes(session, url, MAX_UPLOAD_BYTES)
     if oversize_or_fail or not content:
         await thread.send(
-            f"⚠️ Ukuran file besar / unduh langsung gagal. Ini tautannya:\n{tunnel_url}",
+            f"⚠️ Ukuran file besar / unduh langsung gagal. Ini tautannya:\n{url}",
             view=DlActionView(thread, author.id)
         )
         return
+    file = discord.File(io.BytesIO(content), filename=filename or "media.bin")
+    await thread.send(content=f"Media untuk {author.mention}", file=file, view=DlActionView(thread, author.id))
 
-    file = discord.File(io.BytesIO(content), filename=filename)
-    await thread.send(
-        content=f"Media untuk {author.mention}",
-        file=file,
-        view=DlActionView(thread, author.id)
-    )
+async def process_download_in_thread(thread: discord.Thread, author: discord.Member, link: str):
+    await thread.send("⏳ Tunggu sebentar, aku ambil medianya…")
+
+    data, err = _post_siputzx(link)
+    if not data:
+        await thread.send(f"❌ Gagal mengambil media: {err or 'unknown error'}", view=DlActionView(thread, author.id))
+        return
+
+    status = str(data.get("status", "")).lower()
+
+    # 1) Instagram carousel / picker
+    if status == "picker" and isinstance(data.get("picker"), list) and data["picker"]:
+        items = data["picker"]
+        # Kirim semua foto. Batasi agar tidak berlebihan (misal 15)
+        limit = min(len(items), 15)
+        sent_any = False
+        for i, it in enumerate(items[:limit], start=1):
+            mtype = it.get("type")
+            url = it.get("url") or it.get("thumb")
+            if not url:
+                continue
+            fname = f"ig_photo_{i:02d}.jpg" if mtype == "photo" else f"ig_item_{i:02d}.bin"
+            await _send_file_or_link(thread, author, url, fname)
+            sent_any = True
+        if not sent_any:
+            await thread.send("❌ Tidak ada item yang bisa diunduh dari carousel itu.", view=DlActionView(thread, author.id))
+        else:
+            await thread.send("✅ Carousel selesai dikirim.", view=DlActionView(thread, author.id))
+        return
+
+    # 2) Tunnel file standar (video, dll.)
+    tunnel = data.get("url")
+    filename = data.get("filename") or "media.mp4"
+    if isinstance(tunnel, str) and tunnel.startswith("http"):
+        await _send_file_or_link(thread, author, tunnel, filename)
+        return
+
+    # 3) Fallback info lain (mis. struktur lain dari API)
+    # Coba cari key yang terlihat seperti direct url
+    for k in ("play", "hdplay", "wmplay", "download", "source"):
+        v = data.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            await _send_file_or_link(thread, author, v, filename)
+            return
+
+    await thread.send("❌ Tidak menemukan media pada tautan tersebut.", view=DlActionView(thread, author.id))
 
 # =========================
 # SATU-SATUNYA on_message
@@ -633,11 +667,10 @@ async def on_message(message: discord.Message):
                 await message.delete()
             except Exception:
                 pass
-            warn = await message.channel.send(
+            await message.channel.send(
                 f"{message.author.mention} demi privasi, gunakan perintah **`!dw`** dulu untuk membuat thread privat, ya.",
                 delete_after=30
             )
-            # jangan return; user mungkin juga kirim command
 
     # C) Deteksi !mabar / !main
     content_low = message.content.lower()
@@ -731,7 +764,7 @@ async def announce(ctx: commands.Context, *, text: str = ""):
     Opsi:
       --mention @everyone|@here|<@&ROLEID>
       --footer "teks footer"
-    Attachment (gambar) akan di-embed.
+    Attachment (gambar) akan di-embed (pertama sebagai image di embed).
     """
     if ctx.channel.id != CHANNEL_ID_LOGS:
         return await ctx.send("Perintah ini hanya di channel moderator/log.", delete_after=8)
@@ -740,9 +773,7 @@ async def announce(ctx: commands.Context, *, text: str = ""):
     footer_val = None
 
     # Parse flags
-    m_footer = re.search(r'--footer\s+"([^"]+)"', text)
-    if not m_footer:
-        m_footer = re.search(r"--footer\s+'([^']+)'", text)
+    m_footer = re.search(r'--footer\s+"([^"]+)"', text) or re.search(r"--footer\s+'([^']+)'", text)
     if m_footer:
         footer_val = m_footer.group(1)
         text = text[:m_footer.start()] + text[m_footer.end():]
@@ -777,12 +808,8 @@ async def announce(ctx: commands.Context, *, text: str = ""):
             except Exception:
                 pass
 
-    content_prefix = ""
-    if mention_val:
-        # Izinkan @everyone/@here/role mention literal
-        content_prefix = mention_val + "\n"
-
-    sent = await dest.send(content=content_prefix or None, embed=embed if (body or image_set) else None, files=files_to_send or None)
+    content_prefix = mention_val + "\n" if mention_val else None
+    sent = await dest.send(content=content_prefix, embed=embed if (body or image_set) else None, files=files_to_send or None)
 
     # Log di Firestore
     log_announcement({
