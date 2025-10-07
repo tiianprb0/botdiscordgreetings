@@ -1,21 +1,20 @@
 # main_bot.py
-
 import os
 import re
-import io
 import json
+import io
+import math
 import asyncio
-from typing import Optional, Tuple, List, Dict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
+from typing import Optional, List, Tuple
 
 import discord
 from discord.ext import commands
-from discord.ui import View, button, Button
+from discord import app_commands
 
 import aiohttp
-import requests  # fallback sync → dipanggil via asyncio.to_thread agar non-blocking
+import requests
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -42,7 +41,7 @@ except Exception as e:
     raise
 
 # =========================
-# KONFIG DISCORD (ID SERVER)
+# KONFIG DISCORD
 # =========================
 CHANNEL_ID_WELCOME       = 1423964756158447738
 CHANNEL_ID_LOGS          = 1423969192389902339
@@ -50,13 +49,10 @@ CHANNEL_ID_MABAR         = 1424029336683679794
 CHANNEL_ID_INTRO         = 1424033383339659334
 RULES_CHANNEL_ID         = 1423969192389902336
 ROLE_ID_LIGHT            = 1424026593143164958
-CHANNEL_ID_PHOTO_MEDIA   = 1424033929874247802  # tujuan forward foto
-
-# Downloader
-CHANNEL_ID_DOWNLOADER    = 1425023771185774612  # channel "downloader"
-CHANNEL_ID_CHAT_GENERAL  = 1424032583519567952  # channel umum untuk pendeteksi link
-
-REACTION_EMOJI = "🔆"
+CHANNEL_ID_PHOTO_MEDIA   = 1424033929874247802  # forward foto
+CHANNEL_ID_DOWNLOADER    = 1425023771185774612  # channel downloader target
+CHANNEL_ID_LINK_DETECT   = 1424032583519567952  # channel lain: jika ada link IG/TT → arahkan ke downloader
+REACTION_EMOJI           = "🔆"
 
 # WIB timezone
 TZ = ZoneInfo("Asia/Jakarta")
@@ -118,10 +114,10 @@ def parse_natural_time(text: str, ref: datetime):
 # =========================
 # FIRESTORE HELPERS
 # =========================
-WELCOME_COL      = "welcome_messages"
-MABAR_COL        = "mabar_reminders"
-DOWNLOADER_META  = "downloader_meta"      # doc: f"guild_{guild_id}"
-DOWNLOADER_LOGS  = "downloader_logs"
+WELCOME_COL   = "welcome_messages"
+MABAR_COL     = "mabar_reminders"
+DL_SETTINGS   = "downloader_settings"  # per guild: { enabled: bool }
+DL_NOTICE     = "downloader_notice"    # per guild: { message_id }
 
 async def save_welcome_message(user_id: int, message_id: int):
     try:
@@ -132,7 +128,7 @@ async def save_welcome_message(user_id: int, message_id: int):
     except Exception as e:
         print("[WARN] Gagal simpan welcome_messages:", e)
 
-async def get_welcome_message(user_id: int) -> Optional[int]:
+async def get_welcome_message(user_id: int) -> int | None:
     try:
         doc = db.collection(WELCOME_COL).document(str(user_id)).get()
         if doc.exists:
@@ -173,267 +169,40 @@ def load_pending_mabar(now_epoch: float):
         print("[WARN] Gagal load pending mabar:", e)
         return []
 
-def get_downloader_doc(guild_id: int):
-    return db.collection(DOWNLOADER_META).document(f"guild_{guild_id}")
-
-def ensure_downloader_state(guild_id: int) -> dict:
-    docref = get_downloader_doc(guild_id)
-    doc = docref.get()
-    if not doc.exists:
-        state = {"enabled": True, "notice_sent": False, "updated_at": firestore.SERVER_TIMESTAMP}
-        docref.set(state)
-        return state
-    return doc.to_dict() or {"enabled": True, "notice_sent": False}
-
-def set_downloader_state(guild_id: int, **fields):
+def get_downloader_enabled(guild_id: int) -> bool:
     try:
-        get_downloader_doc(guild_id).set({**fields, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+        doc = db.collection(DL_SETTINGS).document(str(guild_id)).get()
+        if doc.exists:
+            return bool(doc.to_dict().get("enabled", True))
     except Exception as e:
-        print("[WARN] gagal set_downloader_state:", e)
-
-def log_downloader_event(guild_id: int, data: dict):
-    try:
-        key = f"{guild_id}-{int(datetime.utcnow().timestamp()*1000)}"
-        db.collection(DOWNLOADER_LOGS).document(key).set({**data, "ts": firestore.SERVER_TIMESTAMP})
-    except Exception as e:
-        print("[WARN] gagal log_downloader_event:", e)
-
-# =========================
-# NETWORK / DOWNLOADER HELPERS
-# =========================
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"
-)
-
-def is_ig_url(text: str) -> bool:
-    t = (text or "").lower()
-    return "instagram.com" in t
-
-def is_tt_url(text: str) -> bool:
-    t = (text or "").lower()
-    return "tiktok.com" in t or "vt.tiktok.com" in t
-
-def extract_first_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r'(https?://[^\s>]+)', text)
-    return m.group(1) if m else None
-
-def _platform_headers(platform: str) -> dict:
-    if platform == "ig":
-        ref = "https://www.instagram.com/"
-        origin = "https://www.instagram.com"
-    else:
-        ref = "https://www.tiktok.com/"
-        origin = "https://www.tiktok.com"
-    return {
-        "User-Agent": BROWSER_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": ref,
-        "Origin": origin,
-        "Connection": "keep-alive",
-    }
-
-def _api_url(platform: str, post_url: str) -> str:
-    q = urlencode({"url": post_url})  # => url=https%3A%2F%2F...
-    if platform == "ig":
-        return f"https://api.ryzumi.vip/api/downloader/igdl?{q}"
-    else:
-        return f"https://api.ryzumi.vip/api/downloader/ttdl?{q}"
-
-def _pick_tt_media(u: dict) -> Optional[str]:
-    data = u.get("data") or {}
-    inner = data.get("data") or {}
-    for key in ("hdplay", "play", "wmplay"):
-        val = inner.get(key)
-        if isinstance(val, str) and val.startswith("http"):
-            return val
-    # dokumentasi varian
-    music = u.get("music") or {}
-    play_url = music.get("play_url") or {}
-    if isinstance(play_url, dict):
-        lst = play_url.get("url_list")
-        if isinstance(lst, list) and lst and isinstance(lst[0], str):
-            return lst[0]
-    return None
-
-async def fetch_api_fresh(session: aiohttp.ClientSession, platform: str, post_url: str) -> List[str]:
-    api = _api_url(platform, post_url)
-    headers = _platform_headers(platform)
-    for attempt in range(3):
-        try:
-            async with session.get(api, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as r:
-                if r.status >= 500:
-                    await asyncio.sleep(1.2 * (attempt + 1))
-                    continue
-                if r.status != 200:
-                    raise RuntimeError(f"API {platform} status {r.status}")
-                data = await r.json(content_type=None)
-                urls: List[str] = []
-                if platform == "ig":
-                    arr = data.get("data") or []
-                    for it in arr:
-                        u = (it.get("url") or "").strip()
-                        if not u and it.get("thumbnail"):
-                            u = it["thumbnail"]
-                        if u.startswith("http"):
-                            urls.append(u)
-                else:
-                    u = _pick_tt_media(data)
-                    if u and u.startswith("http"):
-                        urls.append(u)
-                return urls
-        except Exception:
-            if attempt == 2:
-                raise
-            await asyncio.sleep(1.0 * (attempt + 1))
-    return []
-
-# ---- Fallback pakai requests (sesuai snippet kamu) ----
-def fetch_api_requests(platform: str, post_url: str) -> List[str]:
-    api = _api_url(platform, post_url)
-    headers = _platform_headers(platform)
-    try:
-        resp = requests.get(api, headers=headers, timeout=25)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        urls: List[str] = []
-        if platform == "ig":
-            arr = data.get("data") or []
-            for it in arr:
-                u = (it.get("url") or "").strip()
-                if not u and it.get("thumbnail"):
-                    u = it["thumbnail"]
-                if u.startswith("http"):
-                    urls.append(u)
-        else:
-            u = _pick_tt_media(data)
-            if u and u.startswith("http"):
-                urls.append(u)
-        return urls
-    except Exception:
-        return []
-
-async def fetch_api_fresh_with_fallback(platform: str, post_url: str) -> List[str]:
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=8)) as session:
-        try:
-            return await fetch_api_fresh(session, platform, post_url)
-        except Exception:
-            # panggil requests di thread pool agar non-blocking
-            return await asyncio.to_thread(fetch_api_requests, platform, post_url)
-
-async def stream_send_or_link(
-    session: aiohttp.ClientSession,
-    thread: discord.Thread,
-    media_url: str,
-    platform: str,
-    max_bytes: int = 25 * 1024 * 1024,
-) -> bool:
-    headers = _platform_headers(platform)
-    timeout = aiohttp.ClientTimeout(total=180, sock_connect=15, sock_read=45)
-
-    async def _try_download() -> Tuple[Optional[bytes], Optional[str]]:
-        # HEAD size
-        try:
-            async with session.head(media_url, headers=headers, timeout=timeout, allow_redirects=True) as hr:
-                if 200 <= hr.status < 400:
-                    cl = hr.headers.get("Content-Length")
-                    if cl and cl.isdigit() and int(cl) > max_bytes:
-                        return None, "big"
-        except Exception:
-            pass
-        # GET streaming
-        try:
-            async with session.get(media_url, headers=headers, timeout=timeout, allow_redirects=True) as gr:
-                if gr.status in (403, 429) or gr.status >= 500:
-                    return None, f"retry:{gr.status}"
-                buf = bytearray()
-                async for chunk in gr.content.iter_chunked(64 * 1024):
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    if len(buf) > max_bytes:
-                        return None, "big"
-                return bytes(buf), None
-        except asyncio.TimeoutError:
-            return None, "timeout"
-        except Exception:
-            return None, "err"
-
-    # retry backoff
-    for attempt in range(3):
-        data, reason = await _try_download()
-        if data is not None:
-            filename = "media.mp4" if (".mp4" in media_url or "video" in media_url) else "media"
-            try:
-                await thread.send(file=discord.File(fp=io.BytesIO(data), filename=filename))
-                return True
-            except Exception as e:
-                print("[WARN] gagal upload file:", e)
-                await thread.send(f"🔗 Gagal upload file, ini tautannya:\n{media_url}")
-                return True
-
-        if reason == "big":
-            await thread.send(f"📦 >25MB, aku kirim tautan unduhan saja:\n{media_url}")
-            return True
-
-        await asyncio.sleep(1.2 * (attempt + 1))
-
-    await thread.send(f"⚠️ Gagal mengunduh media (403/timeout). Ini tautannya saja:\n{media_url}")
+        print("[WARN] get_downloader_enabled:", e)
     return True
 
-# =========================
-# UI BUTTONS (Downloader)
-# =========================
-class DownloaderView(View):
-    def __init__(self, thread: discord.Thread, requester: discord.Member, timeout: int = 600):
-        super().__init__(timeout=timeout)
-        self.thread = thread
-        self.requester = requester
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.requester.id
-
-    @button(label="Download Lagi", style=discord.ButtonStyle.primary)
-    async def more_btn(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message(
-            "Kirim tautan Instagram/TikTok berikutnya di thread ini ya…",
-            ephemeral=True
+def set_downloader_enabled(guild_id: int, enabled: bool):
+    try:
+        db.collection(DL_SETTINGS).document(str(guild_id)).set(
+            {"enabled": enabled, "updated_at": firestore.SERVER_TIMESTAMP},
+            merge=True
         )
-        def check_msg(m: discord.Message):
-            return (
-                m.author.id == self.requester.id
-                and m.channel.id == self.thread.id
-                and (is_ig_url(m.content) or is_tt_url(m.content) or extract_first_url(m.content))
-            )
-        try:
-            msg = await bot.wait_for("message", timeout=180, check=check_msg)
-            link = extract_first_url(msg.content) or msg.content.strip()
-            await handle_download_flow(self.thread, self.requester, link)
-        except asyncio.TimeoutError:
-            try:
-                await self.thread.send("⌛ Waktu habis menunggu link baru. Kamu bisa klik **Download Lagi** lagi kapan pun.")
-            except Exception:
-                pass
+    except Exception as e:
+        print("[WARN] set_downloader_enabled:", e)
 
-    @button(label="Tutup Thread", style=discord.ButtonStyle.danger)
-    async def close_btn(self, interaction: discord.Interaction, button: Button):
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except Exception:
-            pass
-        try:
-            await self.thread.send("👋 Oke, thread akan diarsip. Makasih sudah pakai downloader!")
-            await self.thread.edit(archived=True, locked=True)
-        except Exception as e:
-            print("[WARN] gagal tutup thread:", e)
-        try:
-            await interaction.followup.send("Thread ditutup.", ephemeral=True)
-        except Exception:
-            pass
+def get_downloader_notice(guild_id: int) -> Optional[int]:
+    try:
+        doc = db.collection(DL_NOTICE).document(str(guild_id)).get()
+        if doc.exists:
+            return int(doc.to_dict().get("message_id", 0)) or None
+    except Exception as e:
+        print("[WARN] get_downloader_notice:", e)
+    return None
+
+def set_downloader_notice(guild_id: int, message_id: int):
+    try:
+        db.collection(DL_NOTICE).document(str(guild_id)).set(
+            {"message_id": message_id, "created_at": firestore.SERVER_TIMESTAMP}
+        )
+    except Exception as e:
+        print("[WARN] set_downloader_notice:", e)
 
 # =========================
 # STARTUP
@@ -446,18 +215,46 @@ async def on_ready():
     except Exception:
         pass
 
-    # Resume mabar reminder
+    # Resume mabar reminders
     pending = load_pending_mabar(to_epoch(now_wib()))
     if pending:
-        print(f"🕰️ Menjadwalkan ulang {len(pending)} reminder mabar dari Firestore.")
+        print(f"⏲️ Menjadwalkan ulang {len(pending)} reminder mabar dari Firestore.")
     for doc_id, dat in pending:
         asyncio.create_task(schedule_mabar_tasks_from_doc(doc_id, dat))
 
-    # Kirim notice downloader sekali (anti-duplikat)
-    try:
-        await maybe_send_downloader_notice()
-    except Exception as e:
-        print("[WARN] notice downloader:", e)
+    # Pastikan pemberitahuan downloader (anti-duplikat)
+    await ensure_downloader_notice()
+
+async def ensure_downloader_notice():
+    ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    gid = ch.guild.id if ch.guild else 0
+    exists_msg_id = get_downloader_notice(gid)
+    if exists_msg_id:
+        # Coba fetch—kalau sudah terhapus, kirim lagi
+        try:
+            _ = await ch.fetch_message(exists_msg_id)
+            return
+        except Exception:
+            pass
+
+    enabled = get_downloader_enabled(gid)
+    status_bullet = "🟢" if enabled else "🔴"
+    embed = discord.Embed(
+        title="Downloader Center",
+        description=(
+            "Cukup kirimkan **tautan postingan** di sini — "
+            "bot akan **otomatis membuat thread pribadi** khusus untukmu 🤫\n"
+            "*(Hanya kamu dan bot yang dapat melihat percakapan tersebut.)*\n\n"
+            "📦 **Maksimum ukuran media:** 25 MB\n"
+            "Lebih dari itu, bot akan mengirimkan **tautan unduhan**.\n\n"
+            f"| {status_bullet} Fitur ini aktif untuk member dengan role 🔆 Light."
+        ),
+        color=discord.Color.blurple()
+    )
+    msg = await ch.send(embed=embed)
+    set_downloader_notice(gid, msg.id)
 
 # =========================
 # GREETINGS (WELCOME + EMOJI)
@@ -524,7 +321,7 @@ async def on_member_remove(member: discord.Member):
 # =========================
 # REACTION ROLE (WELCOME MSG)
 # =========================
-async def _safe_get_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+async def _safe_get_member(guild: discord.Guild, user_id: int) -> discord.Member | None:
     m = guild.get_member(user_id)
     if m is None:
         try:
@@ -610,7 +407,7 @@ async def on_message_delete(message: discord.Message):
     await log_channel.send(embed=embed)
 
 # =========================
-# FORWARD GAMBAR DENGAN KONFIRMASI
+# DETEKSI GAMBAR & FORWARD DGN KONFIRMASI
 # =========================
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
@@ -625,6 +422,7 @@ def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 async def _confirm_and_forward_images(message: discord.Message):
+    """Konfirmasi  ✅/❌ lalu forward gambar; auto-hapus prompt 30 detik."""
     if not message.guild or not message.attachments:
         return
 
@@ -635,7 +433,7 @@ async def _confirm_and_forward_images(message: discord.Message):
     prompt = await message.channel.send(
         f"hola {message.author.mention}, apakah kamu ingin foto nya aku forward ke **Channel Photo-Media**?"
     )
-
+    # Auto-hapus prompt dalam 30 detik bila tidak ada aksi
     async def prompt_timeout_cleanup():
         await asyncio.sleep(30)
         try:
@@ -662,14 +460,19 @@ async def _confirm_and_forward_images(message: discord.Message):
         reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
         decided = True
     except asyncio.TimeoutError:
+        # timeout -> prompt akan dihapus oleh timeout_task
         await message.channel.send("⏰ Konfirmasi habis. Forward dibatalkan.", delete_after=6)
         return
 
     if decided:
-        try: timeout_task.cancel()
-        except Exception: pass
-        try: await prompt.delete()
-        except Exception: pass
+        try:
+            timeout_task.cancel()
+        except Exception:
+            pass
+        try:
+            await prompt.delete()
+        except Exception:
+            pass
 
     if str(reaction.emoji) == "❌":
         await message.channel.send("❌ Oke, tidak di-forward.", delete_after=5)
@@ -693,7 +496,11 @@ async def _confirm_and_forward_images(message: discord.Message):
             except Exception as e:
                 print("[WARN] Gagal mengambil attachment:", e)
 
-        sent = await dest.send(content=content, files=files) if files else await dest.send(content)
+        sent = None
+        if files:
+            sent = await dest.send(content=content, files=files)
+        else:
+            sent = await dest.send(content)
 
         jump = _jump_url(message.guild.id, dest.id, sent.id) if sent else ""
         await message.channel.send(
@@ -708,81 +515,259 @@ async def _confirm_and_forward_images(message: discord.Message):
         await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
 
 # =========================
-# DOWNLOADER LOGIC
+# DOWNLOADER (IG/TT) — HELPERS
 # =========================
-async def maybe_send_downloader_notice():
-    guild = bot.guilds[0] if bot.guilds else None
-    if not guild:
-        return
-    state = ensure_downloader_state(guild.id)
-    if state.get("notice_sent"):
-        return
-    ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    text = (
-        "Untuk menjaga privasi, gunakan perintah **`!dw`** di sini —\n"
-        "bot akan membuat **thread pribadi** khusus untukmu 🤫\n"
-        "(hanya kamu dan bot yang dapat melihat percakapan tersebut).\n\n"
-        "📦 **Maksimum ukuran media: 25 MB**\n"
-        "Lebih dari itu, bot akan mengirimkan tautan unduhan.\n"
-        "| 🟢 Fitur ini aktif untuk member dengan role 🔆 Light."
+IG_RE = re.compile(r"(https?://(www\.)?instagram\.com/[^ \n]+)", re.IGNORECASE)
+TT_RE = re.compile(r"(https?://(www\.)?(vm\.|vt\.)?tiktok\.com/[^ \n]+)", re.IGNORECASE)
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB
+
+def _platform_from_text(text: str) -> Optional[str]:
+    if IG_RE.search(text):
+        return "ig"
+    if TT_RE.search(text):
+        return "tt"
+    return None
+
+def _extract_first_url(text: str) -> Optional[str]:
+    m = IG_RE.search(text)
+    if m:
+        return m.group(1)
+    m = TT_RE.search(text)
+    if m:
+        return m.group(1)
+    return None
+
+def _api_url(platform: str, post_url: str) -> str:
+    # Pastikan pakai ?url= (bukan kolon)
+    base = "https://api.ryzumi.vip/api/downloader/igdl" if platform == "ig" \
+        else "https://api.ryzumi.vip/api/downloader/ttdl"
+    from urllib.parse import urlencode
+    qs = urlencode({"url": post_url})
+    return f"{base}?{qs}"
+
+def _platform_headers(platform: str) -> dict:
+    # Header mirip browser + referer domain platform
+    referer = "https://www.instagram.com/" if platform == "ig" else "https://www.tiktok.com/"
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/127.0.0.1 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": referer,
+        "Connection": "keep-alive",
+    }
+
+def _pick_tt_media(payload: dict) -> Optional[str]:
+    """Ambil hdplay → play → wmplay dari berbagai bentuk nested."""
+    if not isinstance(payload, dict):
+        return None
+    candidate = payload
+    if "data" in candidate and isinstance(candidate["data"], dict):
+        inner = candidate["data"]
+        if "data" in inner and isinstance(inner["data"], dict):
+            candidate = inner["data"]
+        else:
+            candidate = inner
+    for key in ("hdplay", "play", "wmplay"):
+        url = candidate.get(key)
+        if isinstance(url, str) and url.startswith("http"):
+            return url
+    music = payload.get("music") or {}
+    play_url = music.get("play_url")
+    if isinstance(play_url, dict):
+        lst = play_url.get("url_list")
+        if isinstance(lst, list) and lst and isinstance(lst[0], str):
+            return lst[0]
+    return None
+
+async def fetch_api_fresh(session: aiohttp.ClientSession, platform: str, post_url: str) -> List[str]:
+    api = _api_url(platform, post_url)
+    headers = _platform_headers(platform)
+    for attempt in range(3):
+        try:
+            async with session.get(api, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                if r.status >= 500:
+                    await asyncio.sleep(1.2 * (attempt + 1))
+                    continue
+                if r.status != 200:
+                    raise RuntimeError(f"API {platform} status {r.status}")
+                data = await r.json(content_type=None)
+
+                urls: List[str] = []
+                if platform == "ig":
+                    arr = data.get("data") or []
+                    if isinstance(arr, list):
+                        for it in arr:
+                            if not isinstance(it, dict):
+                                continue
+                            u = (it.get("url") or "").strip()
+                            if not u:
+                                thumb = (it.get("thumbnail") or "").strip()
+                                if thumb.startswith("http"):
+                                    u = thumb
+                            if u.startswith("http"):
+                                urls.append(u)
+                    if not urls:
+                        print("[IG] Parser tidak menemukan url. keys:", list(data.keys()))
+                else:
+                    media = _pick_tt_media(data)
+                    if media and media.startswith("http"):
+                        urls.append(media)
+                    if not urls:
+                        print("[TT] Parser tidak menemukan media. keys:", list(data.keys()))
+                        if isinstance(data.get("data"), dict):
+                            print("[TT] data.keys():", list(data["data"].keys()))
+                return urls
+        except Exception as e:
+            if attempt == 2:
+                print("[API] gagal fetch:", e)
+                return []
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return []
+
+def fetch_api_requests(platform: str, post_url: str) -> List[str]:
+    api = _api_url(platform, post_url)
+    headers = _platform_headers(platform)
+    try:
+        resp = requests.get(api, headers=headers, timeout=25)
+        if resp.status_code != 200:
+            print(f"[fallback/{platform}] status:", resp.status_code, resp.text[:200])
+            return []
+        data = resp.json()
+        urls: List[str] = []
+        if platform == "ig":
+            arr = data.get("data") or []
+            if isinstance(arr, list):
+                for it in arr:
+                    if not isinstance(it, dict):
+                        continue
+                    u = (it.get("url") or "").strip()
+                    if not u:
+                        thumb = (it.get("thumbnail") or "").strip()
+                        if thumb.startswith("http"):
+                            u = thumb
+                    if u.startswith("http"):
+                        urls.append(u)
+        else:
+            media = _pick_tt_media(data)
+            if media and media.startswith("http"):
+                urls.append(media)
+        return urls
+    except Exception as e:
+        print(f"[fallback/{platform}] exception:", e)
+        return []
+
+async def download_to_bytes(session: aiohttp.ClientSession, url: str, max_bytes: int) -> Tuple[Optional[bytes], bool]:
+    """Return (content, is_link_fallback). is_link_fallback=True jika > max_bytes atau gagal."""
+    headers = _platform_headers("ig" if "instagram" in url else "tt")
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                print("[download] status:", r.status)
+                return None, True
+            total = 0
+            buff = io.BytesIO()
+            async for chunk in r.content.iter_chunked(1024 * 64):
+                total += len(chunk)
+                if total > max_bytes:
+                    return None, True
+                buff.write(chunk)
+            return buff.getvalue(), False
+    except asyncio.TimeoutError:
+        print("[download] timeout")
+        return None, True
+    except Exception as e:
+        print("[download] exception:", e)
+        return None, True
+
+class DlActionView(discord.ui.View):
+    def __init__(self, thread: discord.Thread, author_id: int):
+        super().__init__(timeout=300)
+        self.thread = thread
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Ini tombol untuk pembuat thread saja.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Download lagi", style=discord.ButtonStyle.primary)
+    async def again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Silakan kirim tautan Instagram/TikTok pada thread ini. Aku akan memprosesnya 🤝",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Tutup thread", style=discord.ButtonStyle.secondary)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.thread.edit(archived=True, locked=True)
+            await interaction.response.send_message("Thread ditutup ✅", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Gagal menutup thread.", ephemeral=True)
+
+async def ensure_private_thread(channel: discord.TextChannel, user: discord.Member) -> discord.Thread:
+    name = f"DL-{user.display_name}".strip()[:80]
+    th = await channel.create_thread(
+        name=name,
+        type=discord.ChannelType.private_thread,
+        invitable=False
     )
     try:
-        msg = await ch.send(text)
-        set_downloader_state(guild.id, notice_sent=True, notice_message_id=msg.id)
-    except Exception as e:
-        print("[WARN] gagal kirim notice downloader:", e)
-
-async def create_private_thread_for_user(base_channel: discord.TextChannel, user: discord.Member) -> Optional[discord.Thread]:
-    try:
-        name = f"dw-{user.name}-{user.discriminator}".lower()
+        await th.add_user(user)
     except Exception:
-        name = f"dw-{user.id}"
-    try:
-        thread = await base_channel.create_thread(name=name, auto_archive_duration=60, reason="Downloader private thread")
-        try:
-            await thread.add_user(user)
-        except Exception:
-            pass
-        return thread
-    except Exception as e:
-        print("[ERROR] create thread:", e)
-        return None
+        pass
+    return th
 
-async def handle_download_flow(thread: discord.Thread, requester: discord.Member, link: str):
-    platform = "ig" if is_ig_url(link) else ("tt" if is_tt_url(link) else None)
+async def process_download_in_thread(thread: discord.Thread, author: discord.Member, link: str):
+    platform = _platform_from_text(link)
     if not platform:
-        await thread.send("⚠️ Tautan tidak dikenali. Kirim link Instagram atau TikTok ya.")
+        await thread.send("Maaf, aku hanya mendukung tautan Instagram/TikTok untuk saat ini.")
         return
 
-    await thread.send("⏳ Tunggu sebentar, aku cek & ambil media…")
+    await thread.send("⏳ Tunggu sebentar, aku ambil medianya…")
 
-    # Panggil API tepat sebelum download (token CDN fresh) dgn fallback requests
-    try:
-        media_urls = await fetch_api_fresh_with_fallback(platform, link)
-    except Exception as e:
-        print("[ERROR] API fetch:", e)
-        await thread.send("⚠️ Tidak bisa menghubungi API downloader. Coba lagi nanti.")
+    urls: List[str] = []
+    # fetch daftar media url
+    async with aiohttp.ClientSession() as session:
+        urls = await fetch_api_fresh(session, platform, link)
+        if not urls:
+            # fallback sync (kadang lebih 'pas' ke gateway tertentu)
+            urls = fetch_api_requests(platform, link)
+
+    if not urls:
+        await thread.send("❌ Tidak menemukan media pada tautan tersebut. Coba tautan lain ya.")
         return
 
-    if not media_urls:
-        await thread.send("⚠️ Tidak menemukan media pada tautan tersebut.")
+    # Ambil 1 saja (IG bisa banyak). Bisa di-improve jadi semua, tapi jaga rate.
+    media_url = urls[0]
+
+    # Download atau kirim link jika >25MB
+    async with aiohttp.ClientSession() as session:
+        content, fallback = await download_to_bytes(session, media_url, MAX_UPLOAD_BYTES)
+
+    if fallback or not content:
+        # kirim link saja
+        await thread.send(
+            f"⚠️ Ukuran file besar / unduh langsung gagal. Ini tautannya:\n{media_url}",
+            view=DlActionView(thread, author.id)
+        )
         return
 
-    # Stream tiap URL & kirim file/link sesuai batas
-    sent_any = False
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=8)) as session:
-        for u in media_urls[:3]:  # batasi 3 per link
-            ok = await stream_send_or_link(session, thread, u, platform)
-            sent_any = sent_any or ok
+    # determine filename
+    ext = ".mp4" if "tiktok" in media_url or "video" in media_url else ".mp4"
+    filename = f"media_{author.id}{ext}"
 
-    # Tampilkan tombol aksi
-    view = DownloaderView(thread, requester)
-    if sent_any:
-        await thread.send("✅ Selesai. Mau unduh lagi atau tutup thread?", view=view)
-    else:
-        await thread.send("⚠️ Tidak ada file yang bisa dikirim. Coba **Download Lagi** atau tutup thread.", view=view)
+    file = discord.File(io.BytesIO(content), filename=filename)
+    await thread.send(
+        content=f"Media untuk {author.mention}",
+        file=file,
+        view=DlActionView(thread, author.id)
+    )
 
 # =========================
 # COMMAND ROUTING + HOOKS
@@ -792,7 +777,21 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Deteksi perintah mabar
+    # 0) Deteksi link IG/TT di CHANNEL_ID_LINK_DETECT → arahkan ke downloader (hapus 5 menit)
+    if message.channel.id == CHANNEL_ID_LINK_DETECT:
+        if _platform_from_text(message.content):
+            ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
+            if isinstance(ch, discord.TextChannel):
+                tip = await message.reply(
+                    f"hola {message.author.mention}, mau download medianya? ke {ch.mention} yuk!",
+                    mention_author=True
+                )
+                try:
+                    await tip.delete(delay=300)
+                except Exception:
+                    pass
+
+    # 1) Deteksi !mabar / !main manual
     content_low = message.content.lower()
     match_cmd = re.search(r'!(mabar|main)\s+(.+)', content_low)
     if match_cmd:
@@ -801,116 +800,37 @@ async def on_message(message: discord.Message):
         await mabar(ctx, arg=arg)
         return
 
-    # Deteksi gambar (konfirmasi forward)
+    # 2) Deteksi gambar + konfirmasi forward
     try:
         await _confirm_and_forward_images(message)
     except Exception as e:
         print("[WARN] Handler forward images error:", e)
 
-    # Deteksi tautan IG/TT di channel umum → arahkan ke channel downloader
-    if message.channel.id == CHANNEL_ID_CHAT_GENERAL:
-        url_in = extract_first_url(message.content)
-        if url_in and (is_ig_url(url_in) or is_tt_url(url_in)):
+    # 3) Downloader UX:
+    # - Di channel downloader: jika user kirim link langsung, ingatkan untuk pakai !dw (privasi)
+    # - Pesan reminder ini dihapus setelah 30 detik
+    if message.channel.id == CHANNEL_ID_DOWNLOADER and not isinstance(message.channel, discord.Thread):
+        if _platform_from_text(message.content):
+            warn = await message.reply(
+                "Demi privasi, jalankan perintah `!dw` dulu ya. Nanti aku bikinkan **thread privat** khusus buat kamu.",
+                mention_author=True
+            )
             try:
-                downloader_ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
-                if isinstance(downloader_ch, discord.TextChannel):
-                    await message.reply(
-                        f"hola {message.author.mention}, mau download medianya? "
-                        f"ke {downloader_ch.mention} dan ketik `!dw` ya! ✨",
-                        mention_author=True,
-                        delete_after=300
-                    )
+                await warn.delete(delay=30)
             except Exception:
                 pass
 
+    # 4) Proses commands biasa
     await bot.process_commands(message)
 
 # =========================
-# COMMANDS: PING
+# COMMANDS UMUM
 # =========================
 @bot.command()
 async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
 
-# =========================
-# COMMANDS: DOWNLOADER
-# =========================
-@bot.command(name="dw-on")
-@commands.has_permissions(manage_guild=True)
-async def dw_on(ctx: commands.Context):
-    set_downloader_state(ctx.guild.id, enabled=True)
-    await ctx.reply("🟢 Downloader diaktifkan.")
-    try:
-        await maybe_send_downloader_notice()
-    except Exception:
-        pass
-
-@bot.command(name="dw-off")
-@commands.has_permissions(manage_guild=True)
-async def dw_off(ctx: commands.Context):
-    set_downloader_state(ctx.guild.id, enabled=False)
-    await ctx.reply("🔴 Downloader dimatikan.")
-
-@bot.command(name="dw")
-async def dw(ctx: commands.Context):
-    """Mulai sesi unduhan privat (hanya di channel downloader)."""
-    if ctx.channel.id != CHANNEL_ID_DOWNLOADER:
-        return await ctx.reply("Gunakan perintah ini di channel downloader ya.", delete_after=8)
-
-    role_light = ctx.guild.get_role(ROLE_ID_LIGHT)
-    if not role_light or role_light not in ctx.author.roles:
-        return await ctx.reply("❌ Fitur ini khusus member dengan role 🔆 **Light**.", delete_after=8)
-
-    state = ensure_downloader_state(ctx.guild.id)
-    if not state.get("enabled", True):
-        return await ctx.reply("⚠️ Downloader sedang dimatikan oleh admin.", delete_after=8)
-
-    base_ch = ctx.channel
-    if not isinstance(base_ch, discord.TextChannel):
-        return await ctx.reply("⚠️ Channel tidak valid.", delete_after=6)
-
-    thread = await create_private_thread_for_user(base_ch, ctx.author)
-    if not isinstance(thread, discord.Thread):
-        return await ctx.reply("⚠️ Gagal membuat thread.", delete_after=6)
-
-    await ctx.reply(f"✅ Thread dibuat: {thread.mention} — lanjut di sana ya!", delete_after=10)
-
-    # Hapus pesan perintah !dw setelah 30 detik (rapi)
-    async def _del_cmd():
-        await asyncio.sleep(30)
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-    asyncio.create_task(_del_cmd())
-
-    guide = (
-        f"Hola {ctx.author.mention}! Kirim **tautan Instagram/TikTok** di sini.\n"
-        "Aku akan ambil media dan mengirimkan file jika ≤ 25MB. Jika lebih besar, akan kukirim tautan unduhan.\n\n"
-        "Contoh:\n"
-        "- https://www.instagram.com/reel/DPOExAWkrVL/?igsh=MWptN2hmc3RocTF2dA==\n"
-        "- https://vt.tiktok.com/ZSUFxSW72\n\n"
-        "Setelah selesai proses pertama, akan muncul tombol **Download Lagi** dan **Tutup Thread**."
-    )
-    guide_msg = await thread.send(guide)
-
-    # Tunggu link pertama dari user (5 menit)
-    def check_msg(m: discord.Message):
-        return (
-            m.author.id == ctx.author.id
-            and m.channel.id == thread.id
-            and (is_ig_url(m.content) or is_tt_url(m.content) or extract_first_url(m.content))
-        )
-    try:
-        first = await bot.wait_for("message", timeout=300, check=check_msg)
-        link = extract_first_url(first.content) or first.content.strip()
-        await handle_download_flow(thread, ctx.author, link)
-    except asyncio.TimeoutError:
-        await thread.send("⌛ Timeout. Kalau masih mau lanjut, kirim link kapan saja ya.")
-
-# =========================
-# MABAR (WIB + Firestore)
-# =========================
+# ---------- MABAR ----------
 async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
     try:
         remind_at_epoch = float(dat["remind_at_epoch"])
@@ -994,26 +914,38 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
     )
     msg = await ctx.send(embed=embed)
     for em in ("✅", "❌"):
-        try: await msg.add_reaction(em)
-        except Exception: pass
+        try:
+            await msg.add_reaction(em)
+        except Exception:
+            pass
 
     def check(reaction, user):
-        return user == ctx.author and str(reaction.emoji) in ["✅","❌"] and reaction.message.id == msg.id
+        return (
+            user == ctx.author
+            and str(reaction.emoji) in ["✅", "❌"]
+            and reaction.message.id == msg.id
+        )
 
     try:
         reaction, _ = await bot.wait_for("reaction_add", timeout=60.0, check=check)
     except asyncio.TimeoutError:
-        try: await msg.delete()
-        except Exception: pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return await ctx.send("⏰ Waktu konfirmasi habis, mabar dibatalkan.", delete_after=5)
 
     if str(reaction.emoji) == "❌":
-        try: await msg.delete()
-        except Exception: pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return await ctx.send("❌ Mabar dibatalkan.", delete_after=5)
 
-    try: await msg.delete()
-    except Exception: pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
     mabar_channel = bot.get_channel(CHANNEL_ID_MABAR)
     if not isinstance(mabar_channel, discord.TextChannel):
@@ -1024,6 +956,7 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
         f"🎮 Kalau nggak sibuk **{when_str}**, join mabar **{map_name.title()}**, yuk!"
     )
     announce_msg = await mabar_channel.send(announce_text)
+
     await ctx.send(f"✅ Pengumuman mabar dikirim ke <#{CHANNEL_ID_MABAR}>", delete_after=5)
 
     # Simpan jadwal & jadwalkan task
@@ -1042,6 +975,112 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
     }
     save_mabar_schedule(doc_id, data)
     await schedule_mabar_tasks_from_doc(doc_id, data)
+
+# ---------- DOWNLOADER COMMANDS ----------
+@bot.command(name="dl_on")
+@commands.has_permissions(administrator=True)
+async def dl_on(ctx: commands.Context):
+    set_downloader_enabled(ctx.guild.id, True)
+    await ctx.send("✅ Downloader di-aktifkan.")
+    await ensure_downloader_notice()
+
+@bot.command(name="dl_off")
+@commands.has_permissions(administrator=True)
+async def dl_off(ctx: commands.Context):
+    set_downloader_enabled(ctx.guild.id, False)
+    await ctx.send("⛔ Downloader di-nonaktifkan.")
+    await ensure_downloader_notice()
+
+@bot.command(name="dw")
+async def dw(ctx: commands.Context):
+    """Mulai sesi download (buat thread privat). Pesan perintah dihapus setelah 30 detik."""
+    if ctx.channel.id != CHANNEL_ID_DOWNLOADER:
+        return await ctx.send(f"Fitur ini hanya di <#{CHANNEL_ID_DOWNLOADER}> ya.", delete_after=7)
+
+    role_light = ctx.guild.get_role(ROLE_ID_LIGHT)
+    if not role_light or role_light not in ctx.author.roles:
+        return await ctx.send("❌ Hanya member dengan role 🔆 Light yang bisa memakai fitur ini.", delete_after=7)
+
+    if not get_downloader_enabled(ctx.guild.id):
+        return await ctx.send("⛔ Fitur downloader sedang non-aktif oleh admin.", delete_after=7)
+
+    # Buat thread privat
+    thread = await ensure_private_thread(ctx.channel, ctx.author)
+
+    guide = (
+        f"Hai {ctx.author.mention}! Kirim **tautan Instagram/TikTok** di thread ini ya.\n"
+        "Aku akan mengunduh dan mengirimkan media (maks 25 MB). Jika lebih besar, akan kukirim tautan unduhnya. 👍"
+    )
+    await thread.send(guide, view=DlActionView(thread, ctx.author.id))
+
+    # Hapus pesan perintah user setelah 30 detik
+    try:
+        await ctx.message.delete(delay=30)
+    except Exception:
+        pass
+
+# Tangani link di thread privat
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # jika user mengedit pesan di thread dengan menambahkan link—proses juga
+    await maybe_process_thread_message(after)
+
+@bot.event
+async def on_message_delete_bulk(messages):
+    # no-op
+    pass
+
+@bot.event
+async def on_thread_update(before: discord.Thread, after: discord.Thread):
+    # no-op
+    pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    # NOTE: fungsi ini sudah dideklarasikan di atas.
+    # Python hanya menjaga yang terakhir. Agar tidak bentrok, gabungkan logika ke satu on_message (sudah dilakukan di atas).
+    # (Section ini dibiarkan kosong supaya tidak override)
+    return
+
+async def maybe_process_thread_message(message: discord.Message):
+    # dipanggil oleh on_message_edit — tapi kita juga panggil manual dari handler utama kalau mau.
+    pass  # tidak diperlukan karena kita proses di handler di bawah
+
+# Handler untuk pesan baru (thread privat downloader)
+@bot.event
+async def on_message_listener(message: discord.Message):
+    # (Tidak dipakai—discord.py tidak punya on_message_listener default.)
+    pass
+
+# Gunakan on_message yang sudah ada untuk juga memeriksa thread:
+_original_on_message = bot.on_message
+
+async def _merged_on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # panggil logika yang sudah ada
+    await _original_on_message(message)
+
+    # Jika pesan berada di thread privat di dalam channel downloader → proses jika berisi link
+    if isinstance(message.channel, discord.Thread):
+        parent = message.channel.parent
+        if parent and parent.id == CHANNEL_ID_DOWNLOADER and not message.author.bot:
+            url = _extract_first_url(message.content)
+            if not url:
+                return
+            # cek role & enabled
+            role_light = message.guild.get_role(ROLE_ID_LIGHT) if message.guild else None
+            if not role_light or role_light not in message.author.roles:
+                await message.channel.send("❌ Hanya member dengan role 🔆 Light yang bisa memakai fitur ini.")
+                return
+            if not get_downloader_enabled(message.guild.id):
+                await message.channel.send("⛔ Fitur downloader sedang non-aktif oleh admin.")
+                return
+            await process_download_in_thread(message.channel, message.author, url)
+
+# ganti handler on_message menjadi merged
+bot.on_message = _merged_on_message
 
 # =========================
 # RUN
