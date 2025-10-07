@@ -3,9 +3,9 @@ import re
 import io
 import json
 import asyncio
+from typing import Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
 
 import aiohttp
 import discord
@@ -14,9 +14,7 @@ from discord.ext import commands
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# =========================
-# ENV & FIREBASE INIT
-# =========================
+# =============== ENV & FIREBASE INIT ===============
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     print("❌ Env DISCORD_BOT_TOKEN tidak ditemukan.")
@@ -35,9 +33,7 @@ except Exception as e:
     print(f"❌ Gagal inisialisasi Firestore: {e}")
     raise
 
-# =========================
-# KONFIG DISCORD
-# =========================
+# =============== DISCORD CONFIG ===============
 CHANNEL_ID_WELCOME       = 1423964756158447738
 CHANNEL_ID_LOGS          = 1423969192389902339
 CHANNEL_ID_MABAR         = 1424029336683679794
@@ -50,17 +46,18 @@ RULES_CHANNEL_ID         = 1423969192389902336
 ROLE_ID_LIGHT            = 1424026593143164958
 
 REACTION_EMOJI = "🔆"
-
-# WIB timezone
 TZ = ZoneInfo("Asia/Jakarta")
 
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True           # butuh toggle "SERVER MEMBERS INTENT" di portal
+intents.message_content = True   # butuh toggle "MESSAGE CONTENT INTENT" di portal
+intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
 KONTEN_LIMIT = 1000
 
-# =========================
-# UTIL TIME
-# =========================
+# =============== TIME HELPERS (WIB) ===============
 def now_wib() -> datetime:
     return datetime.now(TZ)
 
@@ -72,9 +69,6 @@ def to_epoch(dt: datetime) -> float:
 def from_epoch_to_wib(epoch: float) -> datetime:
     return datetime.fromtimestamp(epoch, tz=TZ)
 
-# =========================
-# PARSER WAKTU (WIB)
-# =========================
 def parse_natural_time(text: str, ref: datetime):
     t = text.lower().strip()
     if t in {"now", "sekarang", "skrng"}:
@@ -103,27 +97,27 @@ def parse_natural_time(text: str, ref: datetime):
 
     return target, target.strftime("%H:%M WIB")
 
-# =========================
-# FIRESTORE HELPERS
-# =========================
-WELCOME_COL = "welcome_messages"
-MABAR_COL   = "mabar_reminders"
-ANNOUNCE_COL= "announcements"
-DL_CONFIG   = ("config", "downloader")
-DL_LOGS_COL = "downloads"
+# =============== FIRESTORE HELPERS ===============
+WELCOME_COL  = "welcome_messages"
+MABAR_COL    = "mabar_reminders"
+ANNOUNCE_COL = "announcements"
+DL_CONFIG    = ("config", "downloader")
+DL_LOGS_COL  = "downloads"
+
+# FieldFilter untuk where() baru (hindari warning)
+try:
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    HAS_FIELD_FILTER = True
+except Exception:
+    HAS_FIELD_FILTER = False
 
 def get_ref(col, doc):
     return db.collection(col).document(doc)
 
-async def fs_set(col, doc, data: dict):
-    db.collection(col).document(doc).set(data, merge=True)
-
 async def fs_add(col, data: dict):
     db.collection(col).add(data)
 
-# =========================
-# STARTUP
-# =========================
+# =============== STARTUP ===============
 @bot.event
 async def on_ready():
     print(f"✅ Bot login sebagai {bot.user}")
@@ -132,77 +126,14 @@ async def on_ready():
     except Exception:
         pass
 
-    # Resume semua mabar reminder yg masih 'scheduled'
+    # resume mabar yang masih scheduled
     pending = load_pending_mabar(to_epoch(now_wib()))
     if pending:
-        print(f"⏲️ Menjadwalkan ulang {len(pending)} reminder mabar dari Firestore.")
+        print(f"🕰️ Menjadwalkan ulang {len(pending)} reminder mabar dari Firestore.")
     for doc_id, dat in pending:
         asyncio.create_task(schedule_mabar_tasks_from_doc(doc_id, dat))
 
-# =========================
-# GREETINGS (WELCOME + EMOJI) + AUTO-DELETE 24 JAM
-# =========================
-@bot.event
-async def on_member_join(member: discord.Member):
-    ch = bot.get_channel(CHANNEL_ID_WELCOME)
-    if not isinstance(ch, discord.TextChannel):
-        return
-
-    rules_ch = member.guild.get_channel(RULES_CHANNEL_ID) if member.guild else None
-    rules_text = rules_ch.mention if isinstance(rules_ch, discord.TextChannel) else "#rules"
-
-    role_light = member.guild.get_role(ROLE_ID_LIGHT) if member.guild else None
-    role_text = role_light.mention if role_light else "**Light**"
-
-    desc = (
-        f"Halo {member.mention}, selamat datang di **{member.guild.name}**!\n"
-        f"• Baca aturan di {rules_text}\n"
-        f"• Klik reaksi {REACTION_EMOJI} di pesan ini untuk **ambil role {role_text}**.\n"
-        f"• Klik ulang untuk melepas role."
-    )
-
-    embed = discord.Embed(
-        title="🎉 Selamat Datang!",
-        description=desc,
-        color=discord.Color.green()
-    )
-    embed.set_footer(text="Selamat bergabung & have fun! ✨")
-
-    msg = await ch.send(embed=embed)
-    try:
-        await msg.add_reaction(REACTION_EMOJI)
-    except Exception:
-        pass
-
-    # simpan message id welcome untuk user ini
-    await save_welcome_message(member.id, msg.id)
-
-    # auto-delete 24 jam
-    async def autodelete_welcome():
-        await asyncio.sleep(24 * 3600)
-        stored_id = await get_welcome_message(member.id)
-        if stored_id and stored_id == msg.id:
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            await delete_welcome_message(member.id)
-
-    asyncio.create_task(autodelete_welcome())
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    await delete_welcome_message(member.id)
-    ch = bot.get_channel(CHANNEL_ID_WELCOME)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    embed = discord.Embed(
-        title="👋 Selamat Tinggal",
-        description=f"{member.display_name} telah keluar dari server.",
-        color=discord.Color.red()
-    )
-    await ch.send(embed=embed)
-
+# =============== WELCOME + ROLE + AUTO-DELETE 24 JAM ===============
 async def save_welcome_message(user_id: int, message_id: int):
     try:
         db.collection(WELCOME_COL).document(str(user_id)).set({
@@ -238,38 +169,88 @@ async def _safe_get_member(guild: discord.Guild, user_id: int) -> Optional[disco
     return m
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    ch = bot.get_channel(CHANNEL_ID_WELCOME)
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    rules_ch = member.guild.get_channel(RULES_CHANNEL_ID)
+    rules_text = rules_ch.mention if isinstance(rules_ch, discord.TextChannel) else "#rules"
+
+    role_light = member.guild.get_role(ROLE_ID_LIGHT)
+    role_text = role_light.mention if role_light else "**Light**"
+
+    desc = (
+        f"Halo {member.mention}, selamat datang di **{member.guild.name}**!\n"
+        f"• Baca aturan di {rules_text}\n"
+        f"• Klik reaksi {REACTION_EMOJI} di pesan ini untuk **ambil role {role_text}**.\n"
+        f"• Klik ulang untuk melepas role."
+    )
+
+    embed = discord.Embed(
+        title="🎉 Selamat Datang!",
+        description=desc,
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Selamat bergabung & have fun! ✨")
+
+    msg = await ch.send(embed=embed)
+    try:
+        await msg.add_reaction(REACTION_EMOJI)
+    except Exception:
+        pass
+
+    await save_welcome_message(member.id, msg.id)
+
+    async def autodelete_welcome():
+        await asyncio.sleep(24 * 3600)
+        stored_id = await get_welcome_message(member.id)
+        if stored_id and stored_id == msg.id:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await delete_welcome_message(member.id)
+
+    asyncio.create_task(autodelete_welcome())
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    await delete_welcome_message(member.id)
+    ch = bot.get_channel(CHANNEL_ID_WELCOME)
+    if isinstance(ch, discord.TextChannel):
+        embed = discord.Embed(
+            title="👋 Selamat Tinggal",
+            description=f"{member.display_name} telah keluar dari server.",
+            color=discord.Color.red()
+        )
+        await ch.send(embed=embed)
+
+@bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or str(payload.emoji) != REACTION_EMOJI:
         return
-
     target_msg_id = await get_welcome_message(payload.user_id)
     if not target_msg_id or payload.message_id != target_msg_id:
         return
-
     guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
-
     member = await _safe_get_member(guild, payload.user_id)
     if not member or member.bot:
         return
-
     role = guild.get_role(ROLE_ID_LIGHT)
     if not role:
         return
-
     try:
         if role not in member.roles:
             await member.add_roles(role, reason="Welcome reaction role: Light")
-            intro_channel = guild.get_channel(CHANNEL_ID_INTRO)
-            if isinstance(intro_channel, discord.TextChannel):
-                await intro_channel.send(
+            intro = guild.get_channel(CHANNEL_ID_INTRO)
+            if isinstance(intro, discord.TextChannel):
+                await intro.send(
                     f"Ekhem… {member.mention}! Sebutin umur kamu aja boleh kok. "
                     f"Kalau mau cerita lebih, juga boleh, ngga perlu terlalu detail, ya!"
                 )
-        else:
-            # jika user sudah punya role dan tetap klik add, biarkan saja (idempotent)
-            pass
     except Exception as e:
         print("[ERROR] Gagal add role:", e)
 
@@ -277,32 +258,25 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or str(payload.emoji) != REACTION_EMOJI:
         return
-
     target_msg_id = await get_welcome_message(payload.user_id)
     if not target_msg_id or payload.message_id != target_msg_id:
         return
-
     guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
-
     member = await _safe_get_member(guild, payload.user_id)
     if not member or member.bot:
         return
-
     role = guild.get_role(ROLE_ID_LIGHT)
     if not role:
         return
-
     try:
         if role in member.roles:
             await member.remove_roles(role, reason="Welcome reaction role: Light (remove)")
     except Exception as e:
         print("[ERROR] Gagal remove role:", e)
 
-# =========================
-# LOG PESAN DIHAPUS
-# =========================
+# =============== LOG PESAN DIHAPUS ===============
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot:
@@ -310,11 +284,9 @@ async def on_message_delete(message: discord.Message):
     log_channel = bot.get_channel(CHANNEL_ID_LOGS)
     if not isinstance(log_channel, discord.TextChannel):
         return
-
     raw = (message.content or "")
     konten = raw[:KONTEN_LIMIT] + ("..." if len(raw) > KONTEN_LIMIT else "")
     konten = konten.replace("```", "")
-
     embed = discord.Embed(title="🗑️ Pesan Dihapus", color=discord.Color.orange())
     embed.add_field(name="Pengirim", value=message.author.mention, inline=False)
     if isinstance(message.channel, (discord.TextChannel, discord.Thread)):
@@ -323,9 +295,7 @@ async def on_message_delete(message: discord.Message):
         embed.add_field(name="Konten", value=f"```{konten}```", inline=False)
     await log_channel.send(embed=embed)
 
-# =========================
-# DETEKSI GAMBAR & FORWARD DENGAN KONFIRMASI
-# =========================
+# =============== FORWARD GAMBAR DENGAN KONFIRMASI ===============
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 def _is_image_attachment(att: discord.Attachment) -> bool:
@@ -339,10 +309,8 @@ def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 async def _confirm_and_forward_images(message: discord.Message):
-    """Konfirmasi  ✅/❌ lalu forward gambar; auto-hapus prompt 30 detik."""
     if not message.guild or not message.attachments:
         return
-
     images = [att for att in message.attachments if _is_image_attachment(att)]
     if not images:
         return
@@ -350,20 +318,20 @@ async def _confirm_and_forward_images(message: discord.Message):
     prompt = await message.channel.send(
         f"hola {message.author.mention}, apakah kamu ingin foto nya aku forward ke **Channel Photo-Media**?"
     )
-    # Auto-hapus prompt dalam 30 detik bila tidak ada aksi
+
     async def prompt_timeout_cleanup():
         await asyncio.sleep(30)
         try:
             await prompt.delete()
         except Exception:
             pass
-    timeout_task = asyncio.create_task(prompt_timeout_cleanup())
 
-    try:
-        await prompt.add_reaction("✅")
-        await prompt.add_reaction("❌")
-    except Exception:
-        pass
+    timeout_task = asyncio.create_task(prompt_timeout_cleanup())
+    for em in ("✅", "❌"):
+        try:
+            await prompt.add_reaction(em)
+        except Exception:
+            pass
 
     def check(reaction, user):
         return (
@@ -381,25 +349,19 @@ async def _confirm_and_forward_images(message: discord.Message):
         return
 
     if decided:
-        try:
-            timeout_task.cancel()
-        except Exception:
-            pass
-        try:
-            await prompt.delete()
-        except Exception:
-            pass
+        try: timeout_task.cancel()
+        except Exception: pass
+        try: await prompt.delete()
+        except Exception: pass
 
     if str(reaction.emoji) == "❌":
         await message.channel.send("❌ Oke, tidak di-forward.", delete_after=5)
         return
 
-    # ✅ Forward
     try:
         dest = bot.get_channel(CHANNEL_ID_PHOTO_MEDIA)
         if not isinstance(dest, discord.TextChannel):
-            await message.channel.send("⚠️ Channel Photo-Media tidak ditemukan.", delete_after=6)
-            return
+            return await message.channel.send("⚠️ Channel Photo-Media tidak ditemukan.", delete_after=6)
 
         caption = message.clean_content.strip()
         prefix = f"media dari {message.author.mention}"
@@ -412,27 +374,18 @@ async def _confirm_and_forward_images(message: discord.Message):
             except Exception as e:
                 print("[WARN] Gagal mengambil attachment:", e)
 
-        sent = None
-        if files:
-            sent = await dest.send(content=content, files=files)
-        else:
-            sent = await dest.send(content)
-
+        sent = await dest.send(content=content, files=files) if files else await dest.send(content)
         jump = _jump_url(message.guild.id, dest.id, sent.id) if sent else ""
         await message.channel.send(
-            f"Ekhem.. media {message.author.mention} udah aku forward ke "
-            f"[Media Photo]({jump}), cuss lihat~",
+            f"Ekhem.. media {message.author.mention} udah aku forward ke [Media Photo]({jump}), cuss lihat~",
             suppress_embeds=True,
             delete_after=10
         )
-
     except Exception as e:
         print("[ERROR] Gagal forward foto:", e)
         await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
 
-# =========================
-# MABAR: SCHEDULE + REMINDER + FIRESTORE
-# =========================
+# =============== MABAR: SCHEDULE + REMINDER + FIRESTORE ===============
 def save_mabar_schedule(doc_id: str, data: dict):
     try:
         db.collection(MABAR_COL).document(doc_id).set(data)
@@ -447,12 +400,14 @@ def update_mabar_status(doc_id: str, **fields):
 
 def load_pending_mabar(now_epoch: float):
     try:
-        q = db.collection(MABAR_COL).where("status", "==", "scheduled").stream()
+        if HAS_FIELD_FILTER:
+            q = db.collection(MABAR_COL).where(filter=FieldFilter("status", "==", "scheduled")).stream()
+        else:
+            q = db.collection(MABAR_COL).where("status", "==", "scheduled").stream()
         items = []
         for d in q:
             dat = d.to_dict()
             if "remind_at_epoch" in dat and "guild_id" in dat and "channel_id" in dat and "map_name" in dat:
-                # keep only upcoming or recently scheduled (≤ 90 menit lewat)
                 if dat["remind_at_epoch"] + 5400 > now_epoch:
                     items.append((d.id, dat))
         return items
@@ -585,10 +540,8 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
         f"🎮 Kalau nggak sibuk **{when_str}**, join mabar **{map_name.title()}**, yuk!"
     )
     announce_msg = await mabar_channel.send(announce_text)
-
     await ctx.send(f"✅ Pengumuman mabar dikirim ke <#{CHANNEL_ID_MABAR}>", delete_after=5)
 
-    # Simpan jadwal & jadwalkan task
     doc_id = f"{ctx.guild.id}-{announce_msg.id}"
     data = {
         "status": "scheduled",
@@ -605,13 +558,10 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
     save_mabar_schedule(doc_id, data)
     await schedule_mabar_tasks_from_doc(doc_id, data)
 
-# =========================
-# ANNOUNCEMENT SYSTEM
-# =========================
+# =============== ANNOUNCEMENT ===============
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def announce(ctx, *, text=None):
-    """Kirim pengumuman ke Server Spotlight dari channel logs; log ke Firestore."""
     if ctx.channel.id != CHANNEL_ID_LOGS:
         return await ctx.send("⚠️ Gunakan perintah ini di channel moderator/log.")
     if not text and not ctx.message.attachments:
@@ -625,7 +575,7 @@ async def announce(ctx, *, text=None):
     for att in ctx.message.attachments:
         try:
             files.append(await att.to_file())
-        except:
+        except Exception:
             pass
 
     sent = await spotlight.send(content=text or "", files=files)
@@ -639,9 +589,7 @@ async def announce(ctx, *, text=None):
         "timestamp": now_wib().isoformat()
     })
 
-# =========================
-# DOWNLOADER CONTROL (Panduan 1x, Non-duplicate)
-# =========================
+# =============== DOWNLOADER CONTROL (anti-duplikasi panduan) ===============
 def downloader_embed():
     e = discord.Embed(
         title="🎥 ESKA Media Downloader",
@@ -672,14 +620,11 @@ async def set_downloader_status(status: str, msg_id: Optional[int] = None):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def downloader(ctx, action: str):
-    """ON/OFF fitur downloader dari channel logs. Menghindari duplikasi panduan."""
     if ctx.channel.id != CHANNEL_ID_LOGS:
         return await ctx.send("⚠️ Jalankan di channel moderator/log.")
-
     ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
     if not isinstance(ch, discord.TextChannel):
         return await ctx.send("⚠️ Channel downloader tidak ditemukan.")
-
     status = await get_downloader_status()
 
     if action.lower() == "on":
@@ -688,184 +633,34 @@ async def downloader(ctx, action: str):
             await set_downloader_status("on")
             return await ctx.send("✅ Downloader diaktifkan kembali tanpa membuat panduan baru.")
         guide = await ch.send(embed=downloader_embed())
-        try:
-            await guide.pin()
-        except Exception:
-            pass
+        try: await guide.pin()
+        except Exception: pass
         await set_downloader_status("on", guide.id)
-        await ctx.send("✅ Downloader aktif & panduan dikirim (tanpa duplikasi).")
-
+        await ctx.send("✅ Downloader aktif & panduan dikirim.")
     elif action.lower() == "off":
         await set_downloader_status("off")
-        await ctx.send("🛑 Downloader telah dinonaktifkan oleh moderator.")
-
+        await ctx.send("🛑 Downloader dinonaktifkan.")
     else:
         await ctx.send("Gunakan: `!downloader on` atau `!downloader off`.")
 
-# =========================
-# DOWNLOADER MESSAGE HANDLER + REDIRECT DI CHANNEL PUBLIK
-# =========================
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    content_lower = message.content.lower()
-
-    # 1) Deteksi !mabar / !main manual → agar fitur mabar tetap hidup
-    match_cmd = re.search(r'!(mabar|main)\s+(.+)', content_lower)
-    if match_cmd:
-        ctx = await bot.get_context(message)
-        arg = match_cmd.group(2).strip()
-        await mabar(ctx, arg=arg)
-        return
-
-    # 2) Deteksi gambar + konfirmasi forward (global)
-    try:
-        await _confirm_and_forward_images(message)
-    except Exception as e:
-        print("[WARN] Handler forward images error:", e)
-
-    # 3) Redirect bila link IG/TT muncul di channel publik
-    if message.channel.id == CHANNEL_ID_PUBLIC_CHAT:
-        if re.search(r"(instagram\.com|tiktok\.com)", message.content):
-            reply = await message.reply(
-                f"Hola {message.author.mention}, mau download medianya? "
-                f"Yuk ke <#{CHANNEL_ID_DOWNLOADER}> 🎥",
-                delete_after=300
-            )
-            # (opsional) best-effort hapus pesan reply setelah 5 menit (kalau masih ada)
-            await asyncio.sleep(300)
-            try:
-                await reply.delete()
-            except Exception:
-                pass
-
-    # 4) Proses di channel downloader
-    if message.channel.id == CHANNEL_ID_DOWNLOADER:
-        status = await get_downloader_status()
-        if status.get("status") != "on":
-            return await message.channel.send("⚠️ Downloader sedang nonaktif oleh moderator.", delete_after=10)
-
-        role_light = discord.utils.get(message.guild.roles, id=ROLE_ID_LIGHT)
-        if role_light not in message.author.roles:
-            return await message.reply(
-                f"⚠️ Fitur ini hanya untuk member dengan role {role_light.mention}.",
-                delete_after=10
-            )
-
-        # Jika user kirim link IG/TT → langsung buat thread privat dan proses link tsb
-        if re.search(r"(instagram\.com|tiktok\.com)", message.content):
-            await create_private_download_thread(message, initial_link=message.content.strip())
-
-    # 5) Lanjut ke command lain
-    await bot.process_commands(message)
-
-# =========================
-# DOWNLOADER: PRIVATE THREAD + LOOP
-# =========================
-async def create_private_download_thread(message: discord.Message, initial_link: Optional[str] = None):
-    """Buat private thread (user + bot). Proses initial_link bila ada, lalu beri opsi 🔁/✅."""
-    thread = await message.channel.create_thread(
-        name=f"📥 Downloader – {message.author.display_name}",
-        type=discord.ChannelType.private_thread,
-        invitable=False
-    )
-    try:
-        await thread.add_user(message.author)
-    except Exception:
-        # jika permission add_user gagal, lanjut saja (user biasanya auto-join sebagai starter)
-        pass
-
-    await thread.send(
-        f"Halo {message.author.mention}!\n"
-        f"Kirimkan tautan Instagram atau TikTok di sini ya.\n"
-        f"Maksimum ukuran media 25MB, selebihnya akan aku kirim sebagai link. 🎬"
-    )
-
-    async def wait_for_link() -> Optional[str]:
-        def check(m: discord.Message):
-            return m.channel.id == thread.id and m.author.id == message.author.id and re.search(r"(instagram\.com|tiktok\.com)", m.content)
-        try:
-            msg = await bot.wait_for("message", timeout=120, check=check)
-            return msg.content.strip()
-        except asyncio.TimeoutError:
-            return None
-
-    # Proses initial link jika diberikan
-    if initial_link and re.search(r"(instagram\.com|tiktok\.com)", initial_link):
-        await process_media_download_in_thread(author=message.author, link=initial_link, thread=thread)
-
-    # Loop interaktif: 🔁 untuk lanjut, ✅ untuk tutup
-    while True:
-        menu = await thread.send("Pilih aksi: 🔁 untuk unduh lagi, atau ✅ untuk menutup thread.")
-        for em in ("🔁", "✅"):
-            try:
-                await menu.add_reaction(em)
-            except Exception:
-                pass
-
-        def react_check(r: discord.Reaction, u: discord.User):
-            return u.id == message.author.id and r.message.id == menu.id and str(r.emoji) in ["🔁", "✅"]
-
-        try:
-            reaction, _ = await bot.wait_for("reaction_add", timeout=90, check=react_check)
-        except asyncio.TimeoutError:
-            await thread.send("⏰ Tidak ada respon, thread akan ditutup otomatis dalam 10 detik.")
-            await asyncio.sleep(10)
-            try:
-                await thread.delete()
-            except Exception:
-                pass
-            return
-
-        if str(reaction.emoji) == "✅":
-            await thread.send("👋 Baik! Thread akan ditutup dalam 10 detik…")
-            await asyncio.sleep(10)
-            try:
-                await thread.delete()
-            except Exception:
-                pass
-            return
-        else:
-            await thread.send("Silakan kirim tautan IG/TT berikutnya di bawah ini…")
-            next_link = await wait_for_link()
-            if not next_link:
-                await thread.send("⏰ Waktu habis menunggu tautan. Thread akan ditutup dalam 10 detik.")
-                await asyncio.sleep(10)
-                try:
-                    await thread.delete()
-                except Exception:
-                    pass
-                return
-            await process_media_download_in_thread(author=message.author, link=next_link, thread=thread)
-
-# =========================
-# MEDIA DOWNLOADER CORE
-# =========================
+# =============== DOWNLOADER: PRIVATE THREAD & FETCH MEDIA ===============
 async def fetch_media_bytes(url: str, max_mb: float = 25.0) -> Tuple[Optional[bytes], float, Optional[str]]:
-    """Unduh media secara efisien, cek Content-Length, batasi ukuran. Return (bytes or None, size_mb, ext)"""
     limit_bytes = int(max_mb * 1024 * 1024)
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url) as r:
                 if r.status != 200:
                     return None, 0.0, None
-                # cek Content-Length lebih dulu
                 cl = r.headers.get("Content-Length")
-                ext = None
                 ct = (r.headers.get("Content-Type") or "").lower()
+                ext = None
                 if "video" in ct:
                     ext = ".mp4"
                 elif "image" in ct:
-                    if "jpeg" in ct or "jpg" in ct:
-                        ext = ".jpg"
-                    elif "png" in ct:
-                        ext = ".png"
-                    elif "webp" in ct:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"
+                    if "jpeg" in ct or "jpg" in ct: ext = ".jpg"
+                    elif "png" in ct: ext = ".png"
+                    elif "webp" in ct: ext = ".webp"
+                    else: ext = ".jpg"
 
                 if cl and cl.isdigit() and int(cl) > limit_bytes:
                     size_mb = int(cl) / 1024 / 1024
@@ -884,12 +679,11 @@ async def fetch_media_bytes(url: str, max_mb: float = 25.0) -> Tuple[Optional[by
         return None, 0.0, None
 
 async def process_media_download_in_thread(author: discord.Member, link: str, thread: discord.Thread):
-    """Deteksi platform, panggil API kamu, proses batch IG / single TT, limit 25MB, log Firestore."""
     platform = "instagram" if "instagram.com" in link else "tiktok"
     api = f"https://api.ryzumi.vip/api/downloader/{'igdl' if platform=='instagram' else 'ttdl'}?url={link}"
-
     await thread.send("⏳ Mengambil media…")
 
+    # Panggil API
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(api) as r:
@@ -902,7 +696,7 @@ async def process_media_download_in_thread(author: discord.Member, link: str, th
         })
         return
 
-    # ========== INSTAGRAM (BATCH) ==========
+    # Instagram (batch)
     if platform == "instagram":
         if not data.get("status"):
             await thread.send("⚠️ Gagal mengambil data Instagram.")
@@ -915,8 +709,6 @@ async def process_media_download_in_thread(author: discord.Member, link: str, th
         media_list = data.get("data", [])
         total = len(media_list)
         sent_ok = 0
-        total_mb = 0.0
-
         for idx, media in enumerate(media_list, start=1):
             media_url = media.get("url")
             if not media_url:
@@ -927,30 +719,27 @@ async def process_media_download_in_thread(author: discord.Member, link: str, th
                 })
                 continue
 
-            data_bytes, size_mb, ext = await fetch_media_bytes(media_url, max_mb=25.0)
-            total_mb += max(size_mb, 0)
-
+            data_bytes, size_mb, ext = await fetch_media_bytes(media_url, 25.0)
             if data_bytes is None:
                 await thread.send(f"⚠️ Media {idx}/{total} terlalu besar ({size_mb:.1f} MB). [Lihat di sini]({media_url})")
                 await fs_add(DL_LOGS_COL, {
-                    "user_id": author.id, "platform": platform, "url": link, "file_size_mb": float(size_mb),
-                    "status": "oversize", "batch_index": idx, "batch_total": total, "ts": now_wib().isoformat()
+                    "user_id": author.id, "platform": platform, "url": link,
+                    "file_size_mb": float(size_mb), "status": "oversize",
+                    "batch_index": idx, "batch_total": total, "ts": now_wib().isoformat()
                 })
             else:
                 filename = f"ig_{idx}{ext or '.mp4'}"
-                file = discord.File(io.BytesIO(data_bytes), filename=filename)
-                await thread.send(f"📦 Media {idx}/{total}", file=file)
+                await thread.send(file=discord.File(io.BytesIO(data_bytes), filename=filename))
                 await fs_add(DL_LOGS_COL, {
-                    "user_id": author.id, "platform": platform, "url": link, "file_size_mb": float(size_mb),
-                    "status": "success", "batch_index": idx, "batch_total": total, "ts": now_wib().isoformat()
+                    "user_id": author.id, "platform": platform, "url": link,
+                    "file_size_mb": float(size_mb), "status": "success",
+                    "batch_index": idx, "batch_total": total, "ts": now_wib().isoformat()
                 })
                 sent_ok += 1
+            await asyncio.sleep(1.5)
+        await thread.send(f"✅ IG selesai: {sent_ok}/{total} terkirim.")
 
-            await asyncio.sleep(1.5)  # jeda aman
-
-        await thread.send(f"✅ IG selesai: {sent_ok}/{total} terkirim (≈ {total_mb:.1f} MB).")
-
-    # ========== TIKTOK (SINGLE) ==========
+    # TikTok (single)
     else:
         if not data.get("success"):
             await thread.send("⚠️ Gagal mengambil data TikTok.")
@@ -959,12 +748,10 @@ async def process_media_download_in_thread(author: discord.Member, link: str, th
                 "status": "api_fail", "ts": now_wib().isoformat()
             })
             return
-
         try:
             media_url = data["data"]["data"]["play"]
         except Exception:
             media_url = None
-
         if not media_url:
             await thread.send("⚠️ Respons API tidak berisi URL video.")
             await fs_add(DL_LOGS_COL, {
@@ -973,45 +760,131 @@ async def process_media_download_in_thread(author: discord.Member, link: str, th
             })
             return
 
-        data_bytes, size_mb, ext = await fetch_media_bytes(media_url, max_mb=25.0)
+        data_bytes, size_mb, ext = await fetch_media_bytes(media_url, 25.0)
         if data_bytes is None:
             await thread.send(f"⚠️ File terlalu besar ({size_mb:.1f} MB). [Lihat di sini]({media_url})")
             await fs_add(DL_LOGS_COL, {
-                "user_id": author.id, "platform": platform, "url": link, "file_size_mb": float(size_mb),
-                "status": "oversize", "ts": now_wib().isoformat()
+                "user_id": author.id, "platform": platform, "url": link,
+                "file_size_mb": float(size_mb), "status": "oversize",
+                "ts": now_wib().isoformat()
             })
+        else:
+            await thread.send(file=discord.File(io.BytesIO(data_bytes), filename=f"tiktok{ext or '.mp4'}"))
+            await thread.send("✅ Video TikTok selesai dikirim.")
+            await fs_add(DL_LOGS_COL, {
+                "user_id": author.id, "platform": platform, "url": link,
+                "file_size_mb": float(size_mb), "status": "success",
+                "ts": now_wib().isoformat()
+            })
+
+async def create_private_download_thread(message: discord.Message, initial_link: Optional[str] = None):
+    thread = await message.channel.create_thread(
+        name=f"📥 Downloader – {message.author.display_name}",
+        type=discord.ChannelType.private_thread,
+        invitable=False
+    )
+    try:
+        await thread.add_user(message.author)
+    except Exception:
+        pass
+
+    await thread.send(
+        f"Halo {message.author.mention}!\n"
+        f"Kirimkan tautan Instagram atau TikTok di sini ya.\n"
+        f"📦 Maksimum 25MB, lebih dari itu akan dikirim sebagai link."
+    )
+
+    if initial_link and re.search(r"(instagram\.com|tiktok\.com)", initial_link):
+        await process_media_download_in_thread(author=message.author, link=initial_link, thread=thread)
+
+    while True:
+        menu = await thread.send("Pilih aksi: 🔁 untuk unduh lagi, atau ✅ untuk menutup thread.")
+        for em in ("🔁", "✅"):
+            try: await menu.add_reaction(em)
+            except Exception: pass
+
+        def react_check(r: discord.Reaction, u: discord.User):
+            return u.id == message.author.id and r.message.id == menu.id and str(r.emoji) in ["🔁", "✅"]
+
+        try:
+            reaction, _ = await bot.wait_for("reaction_add", timeout=90, check=react_check)
+        except asyncio.TimeoutError:
+            await thread.send("⏰ Tidak ada respon, thread ditutup dalam 10 detik.")
+            await asyncio.sleep(10)
+            try: await thread.delete()
+            except Exception: pass
             return
-        file = discord.File(io.BytesIO(data_bytes), filename=f"tiktok{ext or '.mp4'}")
-        await thread.send(file=file)
-        await thread.send("✅ Video TikTok selesai dikirim.")
-        await fs_add(DL_LOGS_COL, {
-            "user_id": author.id, "platform": platform, "url": link, "file_size_mb": float(size_mb),
-            "status": "success", "ts": now_wib().isoformat()
-        })
 
-# =========================
-# COMMAND ROUTING & HOOKS
-# =========================
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    # jika user mengedit pesan menjadi link IG/TT di channel downloader → proses
-    if after.author.bot:
-        return
-    if after.channel.id == CHANNEL_ID_DOWNLOADER and re.search(r"(instagram\.com|tiktok\.com)", after.content):
-        status = await get_downloader_status()
-        if status.get("status") == "on":
-            role_light = discord.utils.get(after.guild.roles, id=ROLE_ID_LIGHT)
-            if role_light in after.author.roles:
-                await create_private_download_thread(after, initial_link=after.content.strip())
+        if str(reaction.emoji) == "✅":
+            await thread.send("👋 Baik! Thread akan ditutup dalam 10 detik…")
+            await asyncio.sleep(10)
+            try: await thread.delete()
+            except Exception: pass
+            return
+        else:
+            await thread.send("Kirim tautan IG/TT berikutnya di bawah ini…")
+            def link_check(m: discord.Message):
+                return m.channel.id == thread.id and m.author.id == message.author.id and re.search(r"(instagram\.com|tiktok\.com)", m.content)
+            try:
+                msg = await bot.wait_for("message", timeout=120, check=link_check)
+                await process_media_download_in_thread(author=message.author, link=msg.content.strip(), thread=thread)
+            except asyncio.TimeoutError:
+                await thread.send("⏰ Waktu habis menunggu tautan. Thread ditutup.")
+                await asyncio.sleep(10)
+                try: await thread.delete()
+                except Exception: pass
+                return
 
+# =============== SINGLE on_message HANDLER (TIDAK DIDUPLIKASI) ===============
 @bot.event
 async def on_message(message: discord.Message):
-    # (handler utama sudah di atas; didefinisikan lagi di bawah bisa timpa)
-    return  # guard agar tidak double; definisi di atas sudah menangani semua
+    if message.author.bot:
+        return
 
-# =========================
-# RUN
-# =========================
+    content_lower = message.content.lower()
+
+    # 1) Deteksi !mabar / !main manual
+    match_cmd = re.search(r'!(mabar|main)\s+(.+)', content_lower)
+    if match_cmd:
+        ctx = await bot.get_context(message)
+        arg = match_cmd.group(2).strip()
+        await mabar(ctx, arg=arg)
+        return
+
+    # 2) Deteksi gambar + konfirmasi forward (global)
+    try:
+        await _confirm_and_forward_images(message)
+    except Exception as e:
+        print("[WARN] Handler forward images error:", e)
+
+    # 3) Redirect link IG/TT di channel publik
+    if message.channel.id == CHANNEL_ID_PUBLIC_CHAT:
+        if re.search(r"(instagram\.com|tiktok\.com)", message.content):
+            reply = await message.reply(
+                f"Hola {message.author.mention}, mau download medianya? Yuk ke <#{CHANNEL_ID_DOWNLOADER}> 🎥",
+                delete_after=300
+            )
+            await asyncio.sleep(300)
+            try: await reply.delete()
+            except Exception: pass
+
+    # 4) Proses di channel downloader
+    if message.channel.id == CHANNEL_ID_DOWNLOADER:
+        status = await get_downloader_status()
+        if status.get("status") != "on":
+            return await message.channel.send("⚠️ Downloader sedang nonaktif oleh moderator.", delete_after=10)
+
+        role_light = discord.utils.get(message.guild.roles, id=ROLE_ID_LIGHT)
+        if role_light not in message.author.roles:
+            return await message.reply(f"⚠️ Fitur ini hanya untuk member dengan role {role_light.mention}.", delete_after=10)
+
+        if re.search(r"(instagram\.com|tiktok\.com)", message.content):
+            await create_private_download_thread(message, initial_link=message.content.strip())
+
+    # 5) Lanjutkan ke sistem commands lainnya (!announce, !downloader, !ping, dll)
+    await bot.process_commands(message)
+
+# =============== RUN ===============
 if __name__ == "__main__":
     try:
         bot.run(TOKEN)
