@@ -644,7 +644,7 @@ def downloader_embed():
 
 async def ensure_downloader_guide_exists() -> int:
     """
-    Pastikan pesan panduan ada di channel downloader.
+    Pastikan pesan panduan ada di channel downloaderr.
     Mengembalikan message_id panduan yang aktif.
     """
     ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
