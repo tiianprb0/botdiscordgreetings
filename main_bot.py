@@ -13,6 +13,7 @@ from discord.ext import commands
 
 import aiohttp
 import requests
+import httpx
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -112,12 +113,12 @@ def parse_natural_time(text: str, ref: datetime):
     return target, target.strftime("%H:%M WIB")
 
 # =========================
-# FIRESTORE HELPERS
+# FIRESTORE HELPERS  (disesuaikan dgn struktur: config/downloader)
 # =========================
 WELCOME_COL   = "welcome_messages"
 MABAR_COL     = "mabar_reminders"
-DL_SETTINGS   = "downloader_settings"   # {enabled: bool}
-DL_NOTICE     = "downloader_notice"     # {message_id}
+CONFIG_COL    = "config"
+DL_DOC_ID     = "downloader"          # fields: status ("on"/"off"), info_msg (int), updated (string)
 ANNOUNCE_COL  = "announcements"
 
 async def save_welcome_message(user_id: int, message_id: int):
@@ -170,40 +171,45 @@ def load_pending_mabar(now_epoch: float):
         print("[WARN] load_pending_mabar:", e)
         return []
 
-def get_downloader_enabled(guild_id: int) -> bool:
-    try:
-        doc = db.collection(DL_SETTINGS).document(str(guild_id)).get()
-        if doc.exists:
-            return bool(doc.to_dict().get("enabled", True))
-    except Exception as e:
-        print("[WARN] get_downloader_enabled:", e)
-    return True
+def _dl_ref():
+    return db.collection(CONFIG_COL).document(DL_DOC_ID)
 
-def set_downloader_enabled(guild_id: int, enabled: bool):
+def get_downloader_config() -> dict:
     try:
-        db.collection(DL_SETTINGS).document(str(guild_id)).set(
-            {"enabled": enabled, "updated_at": firestore.SERVER_TIMESTAMP},
+        snap = _dl_ref().get()
+        return snap.to_dict() if snap.exists else {}
+    except Exception as e:
+        print("[WARN] get_downloader_config:", e)
+        return {}
+
+def get_downloader_enabled(guild_id: int) -> bool:
+    # guild_id tidak dipakai di struktur baru; tetap ada utk kompatibilitas
+    cfg = get_downloader_config()
+    return str(cfg.get("status", "on")).lower() == "on"
+
+def set_downloader_status(on: bool):
+    try:
+        _dl_ref().set(
+            {"status": "on" if on else "off", "updated": now_wib().isoformat()},
             merge=True
         )
     except Exception as e:
-        print("[WARN] set_downloader_enabled:", e)
+        print("[WARN] set_downloader_status:", e)
 
-def get_downloader_notice(guild_id: int) -> Optional[int]:
+def get_downloader_notice_id() -> Optional[int]:
     try:
-        doc = db.collection(DL_NOTICE).document(str(guild_id)).get()
-        if doc.exists:
-            return int(doc.to_dict().get("message_id") or 0) or None
+        cfg = get_downloader_config()
+        mid = cfg.get("info_msg")
+        return int(mid) if isinstance(mid, (int, float, str)) and str(mid).isdigit() else None
     except Exception as e:
-        print("[WARN] get_downloader_notice:", e)
-    return None
+        print("[WARN] get_downloader_notice_id:", e)
+        return None
 
-def set_downloader_notice(guild_id: int, message_id: int):
+def set_downloader_notice_id(message_id: int):
     try:
-        db.collection(DL_NOTICE).document(str(guild_id)).set(
-            {"message_id": message_id, "created_at": firestore.SERVER_TIMESTAMP}
-        )
+        _dl_ref().set({"info_msg": int(message_id), "updated": now_wib().isoformat()}, merge=True)
     except Exception as e:
-        print("[WARN] set_downloader_notice:", e)
+        print("[WARN] set_downloader_notice_id:", e)
 
 def log_announcement(data: dict):
     try:
@@ -232,22 +238,8 @@ async def on_ready():
     # Pastikan notice downloader tidak duplikat
     await ensure_downloader_notice()
 
-async def ensure_downloader_notice():
-    ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    gid = ch.guild.id if ch.guild else 0
-    exists_msg_id = get_downloader_notice(gid)
-    if exists_msg_id:
-        try:
-            await ch.fetch_message(exists_msg_id)
-            return  # masih ada
-        except Exception:
-            pass
-    enabled = get_downloader_enabled(gid)
+async def _build_downloader_embed(enabled: bool) -> discord.Embed:
     status_bullet = "🟢" if enabled else "🔴"
-
-    # Teks pemberitahuan persis sesuai brief (menggunakan "!dw" sebagai copy)
     desc = (
         "Cukup !dw untuk mulai men-download —\n"
         "bot akan otomatis membuat **thread pribadi** khusus untukmu 🤫\n"
@@ -256,14 +248,29 @@ async def ensure_downloader_notice():
         "Lebih dari itu, bot akan mengirimkan tautan unduhan.\n"
         f"| {status_bullet} Fitur ini aktif untuk member dengan role 🔆 Light."
     )
+    embed = discord.Embed(title="Downloader Center", description=desc, color=discord.Color.blurple())
+    return embed
 
-    embed = discord.Embed(
-        title="Downloader Center",
-        description=desc,
-        color=discord.Color.blurple()
-    )
+async def ensure_downloader_notice():
+    ch = bot.get_channel(CHANNEL_ID_DOWNLOADER)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    enabled = get_downloader_enabled(ch.guild.id if ch.guild else 0)
+    embed = await _build_downloader_embed(enabled)
+
+    msg_id = get_downloader_notice_id()
+    if msg_id:
+        # Coba edit. Jika tidak ada (terhapus), kirim ulang.
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=embed)
+            return
+        except Exception:
+            pass
+
+    # Kirim baru dan simpan id
     msg = await ch.send(embed=embed)
-    set_downloader_notice(gid, msg.id)
+    set_downloader_notice_id(msg.id)
 
 # =========================
 # GREETINGS + REACTION ROLE
@@ -406,7 +413,7 @@ async def on_message_delete(message: discord.Message):
     await log_channel.send(embed=embed)
 
 # =========================
-# FORWARD GAMBAR DENGAN KONFIRMASI
+# FORWARD GAMBAR DGN KONFIRMASI
 # =========================
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
@@ -428,7 +435,7 @@ async def _confirm_and_forward_images(message: discord.Message):
         return
 
     prompt = await message.channel.send(
-        f"hola {message.author.mention}, apakah kamu ingin foto nya aku forward ke **Channel Photo-Media**?"
+        f"hola {message.author.mention}, apakah kamu ingin fotonya aku forward ke **Channel Photo-Media**?"
     )
     async def timeout_cleanup():
         await asyncio.sleep(30)
@@ -484,10 +491,8 @@ async def _confirm_and_forward_images(message: discord.Message):
         await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
 
 # =========================
-# DOWNLOADER (API: dl.siputzx.my.id) FULL FIX
+# DOWNLOADER (API: dl.siputzx.my.id) + CAROUSEL IG
 # =========================
-import httpx
-
 class DlActionView(discord.ui.View):
     def __init__(self, thread: discord.Thread, author_id: int):
         super().__init__(timeout=300)
@@ -515,7 +520,6 @@ class DlActionView(discord.ui.View):
         except Exception:
             await interaction.response.send_message("❌ Gagal menutup thread.", ephemeral=True)
 
-
 async def ensure_private_thread(channel: discord.TextChannel, user: discord.Member) -> discord.Thread:
     name = f"DL-{user.display_name}".strip()[:80]
     th = await channel.create_thread(name=name, type=discord.ChannelType.private_thread, invitable=False)
@@ -525,14 +529,9 @@ async def ensure_private_thread(channel: discord.TextChannel, user: discord.Memb
         pass
     return th
 
-
 async def post_siputzx(link: str) -> tuple[dict | None, str | None]:
     """Auto deteksi TikTok / Instagram lalu POST ke API dl.siputzx.my.id"""
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     payload = {"url": link}
     if "tiktok" in link:
         payload["videoQuality"] = "1080"
@@ -550,9 +549,7 @@ async def post_siputzx(link: str) -> tuple[dict | None, str | None]:
     except Exception as e:
         return None, str(e)
 
-
 def _headers_for_url(url: str) -> dict:
-    """Atur Referer dinamis biar nggak 403"""
     ref = "https://dl.siputzx.my.id/"
     if "instagram" in url or "cdninstagram" in url:
         ref = "https://www.instagram.com/"
@@ -566,9 +563,7 @@ def _headers_for_url(url: str) -> dict:
         "Accept": "*/*"
     }
 
-
 async def download_bytes(url: str, max_bytes: int = 25_000_000) -> tuple[bytes | None, bool]:
-    """Unduh media dengan header aman"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_headers_for_url(url), timeout=aiohttp.ClientTimeout(total=90)) as r:
@@ -587,7 +582,6 @@ async def download_bytes(url: str, max_bytes: int = 25_000_000) -> tuple[bytes |
         print("[download] error:", e)
         return None, True
 
-
 async def send_media_or_link(thread: discord.Thread, author: discord.Member, url: str, filename: str):
     content, fail = await download_bytes(url)
     if fail or not content:
@@ -595,7 +589,6 @@ async def send_media_or_link(thread: discord.Thread, author: discord.Member, url
         return
     file = discord.File(io.BytesIO(content), filename)
     await thread.send(content=f"📦 Media untuk {author.mention}", file=file, view=DlActionView(thread, author.id))
-
 
 async def process_download_in_thread(thread: discord.Thread, author: discord.Member, link: str):
     await thread.send("⏳ Sedang mengambil media dari tautan...")
@@ -628,7 +621,7 @@ async def process_download_in_thread(thread: discord.Thread, author: discord.Mem
     await thread.send("❌ Tidak menemukan media yang bisa diunduh.", view=DlActionView(thread, author.id))
 
 # =========================
-# SATU-SATUNYA on_message
+# on_message (SATU-SATUNYA)
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
@@ -661,7 +654,7 @@ async def on_message(message: discord.Message):
                 delete_after=30
             )
 
-    # C) Deteksi !mabar / !main
+    # C) Deteksi !mabar / !main (manual)
     content_low = message.content.lower()
     match_cmd = re.search(r'!(mabar|main)\s+(.+)', content_low)
     if match_cmd:
@@ -670,13 +663,13 @@ async def on_message(message: discord.Message):
         await mabar(ctx, arg=arg)
         return
 
-    # D) Forward gambar dengan konfirmasi (semua channel)
+    # D) Forward gambar (konfirmasi)
     try:
         await _confirm_and_forward_images(message)
     except Exception as e:
         print("[WARN] forward images:", e)
 
-    # E) Proses commands (ping, dw, downloader switches, announce, ...)
+    # E) Proses commands (ping, dw, downloader, announce, ...)
     await bot.process_commands(message)
 
     # F) Jika di private thread di bawah downloader → proses link apa saja
@@ -706,15 +699,15 @@ async def ping(ctx: commands.Context):
 @bot.command(name="downloader")
 @commands.has_permissions(administrator=True)
 async def downloader_cmd(ctx: commands.Context, mode: str):
-    """!downloader on | off"""
+    """!downloader on | off  (status disimpan di config/downloader)"""
     mode = mode.lower().strip()
     if ctx.channel.id != CHANNEL_ID_LOGS:
         return await ctx.send("Perintah ini hanya di channel moderator/log.", delete_after=8)
     if mode not in {"on", "off"}:
         return await ctx.send("Gunakan: `!downloader on` atau `!downloader off`", delete_after=8)
-    enabled = (mode == "on")
-    set_downloader_enabled(ctx.guild.id, enabled)
-    await ctx.send(f"✅ Downloader di-{'aktifkan' if enabled else 'nonaktifkan'}.", delete_after=8)
+
+    set_downloader_status(mode == "on")
+    await ctx.send(f"✅ Downloader di-{'aktifkan' if mode == 'on' else 'nonaktifkan'}.", delete_after=8)
     await ensure_downloader_notice()
 
 # ---- Mulai sesi download privat ----
@@ -866,62 +859,12 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
         return await ctx.send("Gunakan format bebas: `!main [nama game/map] [jam/waktu]`")
     await handle_mabar_message(ctx, arg)
 
-
+# Deteksi ajakan natural tanpa prefix
 @bot.event
-async def on_message(message: discord.Message):
-    """Deteksi ajakan natural tanpa prefix !"""
-    if message.author.bot:
-        return
-
-    text = (message.content or "").lower().strip()
-
-    # --- kata kunci trigger & waktu ---
-    trigger_words = ["mabar", "main", "ayo", "yok", "gas", "lets go", "ayok", "yuk"]
-    time_words = ["jam", "besok", "sekarang", "skrng", "skrg", "malam", "pagi", "siang", "sore"]
-
-    # --- kata yang harus diabaikan (variasi orang pertama dll) ---
-    ignore_words = [
-        # pronoun & bentuk informal
-        "aku", "aq", "ak", "akuu", "ako", "akoh", "akuah",
-        "saya", "saye", "sy", "sya", "saye", "sye",
-        "gw", "gue", "guwe", "guweh", "guw", "gua", "guah", "gueh",
-        "ane", "aneh", "aqw", "akuya", "guwwe",
-        "syg", "sayang",
-
-        # bentuk kata “sendiri” & variasinya
-        "sendiri", "sndiri", "sndirian", "sendirian", "sndir", "sendiraan",
-
-        # konteks bukan ajakan
-        "udah", "sudah", "pernah", "telah",
-        "lagi", "lagi nih", "lagi dong", "lagi ya",
-        "kerja", "kerjaan", "belajar", "tidur", "nonton", "afk", "offline",
-
-        # bentuk lain yang umum
-        "mainan", "mainnya", "mainin", "main sendiri", "mainin sendiri",
-    ]
-
-    ignore_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in ignore_words) + r")\b", flags=re.IGNORECASE)
-    trigger_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in trigger_words) + r")\b", flags=re.IGNORECASE)
-    time_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in time_words) + r")\b", flags=re.IGNORECASE)
-
-    # 1️⃣ Abaikan jika mengandung kata ignore
-    if ignore_pattern.search(text):
-        await bot.process_commands(message)
-        return
-
-    # 2️⃣ Deteksi ajakan mabar alami
-    if trigger_pattern.search(text) and time_pattern.search(text):
-        if len(text.split()) >= 3:
-            ctx = await bot.get_context(message)
-            await handle_mabar_message(ctx, text)
-            return
-
-    # 3️⃣ Tetap proses command biasa
-    await bot.process_commands(message)
-
+async def on_message_without_prefix(message: discord.Message):
+    pass  # placeholder (kamu bisa mempertahankan versi deteksi natural bila perlu)
 
 async def handle_mabar_message(ctx: commands.Context, text: str):
-    """Fungsi utama parsing & kirim pengumuman mabar"""
     role_light = ctx.guild.get_role(ROLE_ID_LIGHT) if ctx.guild else None
     if not role_light:
         return await ctx.send("⚠️ Role Light belum diset di kode.")
@@ -968,26 +911,18 @@ async def handle_mabar_message(ctx: commands.Context, text: str):
             pass
 
     def check(reaction, user):
-        return (
-            user == ctx.author
-            and str(reaction.emoji) in ["✅", "❌"]
-            and reaction.message.id == msg.id
-        )
+        return (user == ctx.author and str(reaction.emoji) in ["✅", "❌"] and reaction.message.id == msg.id)
 
     try:
         reaction, _ = await bot.wait_for("reaction_add", timeout=60.0, check=check)
     except asyncio.TimeoutError:
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        try: await msg.delete()
+        except Exception: pass
         return await ctx.send("⏰ Waktu konfirmasi habis, mabar dibatalkan.", delete_after=5)
 
     if str(reaction.emoji) == "❌":
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+        try: await msg.delete()
+        except Exception: pass
         return await ctx.send("❌ Mabar dibatalkan.", delete_after=5)
 
     try:
@@ -1021,7 +956,6 @@ async def handle_mabar_message(ctx: commands.Context, text: str):
     }
     save_mabar_schedule(doc_id, data)
     await schedule_mabar_tasks_from_doc(doc_id, data)
-
 
 # =========================
 # RUN
