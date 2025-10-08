@@ -506,7 +506,7 @@ class DlActionView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="🌸 Tutup thread", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label=" Tutup thread", style=discord.ButtonStyle.secondary)
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await self.thread.edit(archived=True, locked=True)
@@ -872,57 +872,133 @@ async def schedule_mabar_tasks_from_doc(doc_id: str, dat: dict):
 
 @bot.command(aliases=["main"])
 async def mabar(ctx: commands.Context, *, arg: str = None):
-    """Contoh: !mabar Distrik Violence jam 8 malam (WIB)"""
+    """Manual trigger !main [map/game] [jam/waktu]"""
+    if not arg:
+        return await ctx.send("Gunakan format bebas: `!main [nama game/map] [jam/waktu]`")
+    await handle_mabar_message(ctx, arg)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Deteksi ajakan natural tanpa prefix !"""
+    if message.author.bot:
+        return
+
+    text = (message.content or "").lower().strip()
+
+    # --- kata kunci trigger & waktu ---
+    trigger_words = ["mabar", "main", "ayo", "yok", "gas", "lets go", "ayok", "yuk"]
+    time_words = ["jam", "besok", "sekarang", "skrng", "skrg", "malam", "pagi", "siang", "sore"]
+
+    # --- kata yang harus diabaikan (variasi orang pertama dll) ---
+    ignore_words = [
+        # pronoun & bentuk informal
+        "aku", "aq", "ak", "akuu", "ako", "akoh", "akuah",
+        "saya", "saye", "sy", "sya", "saye", "sye",
+        "gw", "gue", "guwe", "guweh", "guw", "gua", "guah", "gueh",
+        "ane", "aneh", "aqw", "akuya", "guwwe",
+        "syg", "sayang",
+
+        # bentuk kata “sendiri” & variasinya
+        "sendiri", "sndiri", "sndirian", "sendirian", "sndir", "sendiraan",
+
+        # konteks bukan ajakan
+        "udah", "sudah", "pernah", "telah",
+        "lagi", "lagi nih", "lagi dong", "lagi ya",
+        "kerja", "kerjaan", "belajar", "tidur", "nonton", "afk", "offline",
+
+        # bentuk lain yang umum
+        "mainan", "mainnya", "mainin", "main sendiri", "mainin sendiri",
+    ]
+
+    ignore_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in ignore_words) + r")\b", flags=re.IGNORECASE)
+    trigger_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in trigger_words) + r")\b", flags=re.IGNORECASE)
+    time_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in time_words) + r")\b", flags=re.IGNORECASE)
+
+    # 1️⃣ Abaikan jika mengandung kata ignore
+    if ignore_pattern.search(text):
+        await bot.process_commands(message)
+        return
+
+    # 2️⃣ Deteksi ajakan mabar alami
+    if trigger_pattern.search(text) and time_pattern.search(text):
+        if len(text.split()) >= 3:
+            ctx = await bot.get_context(message)
+            await handle_mabar_message(ctx, text)
+            return
+
+    # 3️⃣ Tetap proses command biasa
+    await bot.process_commands(message)
+
+
+async def handle_mabar_message(ctx: commands.Context, text: str):
+    """Fungsi utama parsing & kirim pengumuman mabar"""
     role_light = ctx.guild.get_role(ROLE_ID_LIGHT) if ctx.guild else None
     if not role_light:
         return await ctx.send("⚠️ Role Light belum diset di kode.")
     if role_light not in ctx.author.roles:
         return await ctx.send("❌ Kamu belum punya role 🔆 Light untuk pakai perintah ini!")
 
-    if not arg:
-        return await ctx.send("Gunakan format: `!mabar [nama game/map] [jam]`")
-
-    tokens = arg.strip()
-    w_match = re.search(
-        r"(?:\bjam\b|\bpukul\b|(?:\d{1,2}(?::|\.)?\d{0,2})|sekarang|now|besok)",
-        tokens, flags=re.IGNORECASE
+    waktu_pattern = re.compile(
+        r"(jam\s*\d{1,2}[:.]?\d{0,2}\s*(pagi|siang|sore|malam)?|besok|sekarang|skrng|skrg|now)",
+        re.IGNORECASE
     )
-    if w_match:
-        split_idx = w_match.start()
-        map_name = tokens[:split_idx].strip(" ,.-")
-        waktu_text = tokens[split_idx:].strip()
+    waktu_match = waktu_pattern.search(text)
+    waktu_text = waktu_match.group(0) if waktu_match else "sekarang"
+
+    if waktu_match:
+        map_name = text[:waktu_match.start()].strip(" ,.!?")
     else:
-        map_name = tokens.strip(" ,.-")
-        waktu_text = "sekarang"
+        map_name = text.strip(" ,.!?")
+
+    map_name = re.sub(
+        r"\b(yok|ayo|ayok|gas|mabar|main|lets go|ditunggu|nih|ya|nanti|besok|ayo dong|yuk)\b",
+        "",
+        map_name,
+        flags=re.IGNORECASE
+    ).strip()
 
     ref = now_wib()
-    remind_at, when_str = parse_natural_time(waktu_text, ref)
+    waktu_text_norm = re.sub(r"[^a-z0-9:.\s]", "", waktu_text.lower()).strip()
+    remind_at, when_str = parse_natural_time(waktu_text_norm or "sekarang", ref)
 
     embed = discord.Embed(
         title="🎮 Konfirmasi Mabar",
-        description=(f"Game / Map: **{map_name.title()}**\n"
-                     f"Waktu: **{when_str}**\n\n"
-                     f"Kirim pengumuman ke <#{CHANNEL_ID_MABAR}>?"),
-        color=discord.Color.blurple()
+        description=(
+            f"Game / Map: **{map_name.title() or 'Tidak disebut'}**\n"
+            f"Waktu: **{when_str}**\n\n"
+            f"Kirim pengumuman ke <#{CHANNEL_ID_MABAR}>?"
+        ),
+        color=discord.Color.purple()
     )
     msg = await ctx.send(embed=embed)
     for em in ("✅", "❌"):
-        try: await msg.add_reaction(em)
-        except Exception: pass
+        try:
+            await msg.add_reaction(em)
+        except Exception:
+            pass
 
     def check(reaction, user):
-        return user == ctx.author and str(reaction.emoji) in ["✅", "❌"] and reaction.message.id == msg.id
+        return (
+            user == ctx.author
+            and str(reaction.emoji) in ["✅", "❌"]
+            and reaction.message.id == msg.id
+        )
 
     try:
         reaction, _ = await bot.wait_for("reaction_add", timeout=60.0, check=check)
     except asyncio.TimeoutError:
-        try: await msg.delete()
-        except Exception: pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return await ctx.send("⏰ Waktu konfirmasi habis, mabar dibatalkan.", delete_after=5)
 
     if str(reaction.emoji) == "❌":
-        try: await msg.delete()
-        except Exception: pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return await ctx.send("❌ Mabar dibatalkan.", delete_after=5)
 
     try:
@@ -936,12 +1012,11 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
 
     announce_text = (
         f"{role_light.mention}\n"
-        f"🎮 Kalau nggak sibuk **{when_str}**, join mabar **{map_name.title()}**, yuk!"
+        f"🎮 Yuk mabar **{map_name.title()}** jam **{when_str}**!"
     )
     announce_msg = await mabar_channel.send(announce_text)
     await ctx.send(f"✅ Pengumuman mabar dikirim ke <#{CHANNEL_ID_MABAR}>", delete_after=5)
 
-    # simpan ke Firestore + schedule
     doc_id = f"{ctx.guild.id}-{announce_msg.id}"
     data = {
         "status": "scheduled",
@@ -957,6 +1032,7 @@ async def mabar(ctx: commands.Context, *, arg: str = None):
     }
     save_mabar_schedule(doc_id, data)
     await schedule_mabar_tasks_from_doc(doc_id, data)
+
 
 # =========================
 # RUN
