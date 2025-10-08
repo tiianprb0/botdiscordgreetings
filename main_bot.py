@@ -506,7 +506,7 @@ class DlActionView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label=" Tutup thread", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="🌸 Tutup thread", style=discord.ButtonStyle.secondary)
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await self.thread.edit(archived=True, locked=True)
@@ -637,7 +637,6 @@ async def process_download_in_thread(thread: discord.Thread, author: discord.Mem
             return
 
     await thread.send("❌ Tidak menemukan media pada tautan tersebut.", view=DlActionView(thread, author.id))
-
 # =========================
 # SATU-SATUNYA on_message
 # =========================
