@@ -484,10 +484,11 @@ async def _confirm_and_forward_images(message: discord.Message):
         await message.channel.send("⚠️ Terjadi kendala saat forward media.", delete_after=6)
 
 # =========================
-# DOWNLOADER (API: dl.siputzx.my.id) + CAROUSEL IG
+# DOWNLOADER (API: dl.siputzx.my.id) FULL FIX
 # =========================
+import httpx
+
 class DlActionView(discord.ui.View):
-    # Discord tidak mendukung warna custom tombol; pakai emoji nuansa pink 🌸
     def __init__(self, thread: discord.Thread, author_id: int):
         super().__init__(timeout=300)
         self.thread = thread
@@ -495,14 +496,14 @@ class DlActionView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Ini tombol untuk pembuat thread saja.", ephemeral=True)
+            await interaction.response.send_message("Tombol ini hanya untuk pembuat thread.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="🌸 Download lagi", style=discord.ButtonStyle.primary)
     async def again(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
-            "Kirim tautan sosial (IG/TikTok/dll) di thread ini ya. Aman; hanya kamu & bot yang bisa melihat.",
+            "Kirim tautan sosial (TikTok / Instagram / dll) di thread ini.\n🔒 Aman — hanya kamu & bot yang bisa melihat.",
             ephemeral=True
         )
 
@@ -510,9 +511,10 @@ class DlActionView(discord.ui.View):
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await self.thread.edit(archived=True, locked=True)
-            await interaction.response.send_message("Thread ditutup ✅", ephemeral=True)
+            await interaction.response.send_message("✅ Thread ditutup.", ephemeral=True)
         except Exception:
-            await interaction.response.send_message("Gagal menutup thread.", ephemeral=True)
+            await interaction.response.send_message("❌ Gagal menutup thread.", ephemeral=True)
+
 
 async def ensure_private_thread(channel: discord.TextChannel, user: discord.Member) -> discord.Thread:
     name = f"DL-{user.display_name}".strip()[:80]
@@ -523,120 +525,108 @@ async def ensure_private_thread(channel: discord.TextChannel, user: discord.Memb
         pass
     return th
 
-def _build_dl_headers() -> dict:
-    return {
+
+async def post_siputzx(link: str) -> tuple[dict | None, str | None]:
+    """Auto deteksi TikTok / Instagram lalu POST ke API dl.siputzx.my.id"""
+    headers = {
         "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/127.0.0.1 Safari/537.36"
-        ),
-        "Referer": "https://dl.siputzx.my.id/",
+        "Content-Type": "application/json"
     }
 
-def _post_siputzx(link: str) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Panggil API https://dl.siputzx.my.id/ (POST JSON).
-    Return: (json_dict, errstr)
-    """
+    payload = {"url": link}
+    if "tiktok" in link:
+        payload["videoQuality"] = "1080"
+        payload["downloadMode"] = "auto"
+    elif "instagram" in link:
+        payload["videoQuality"] = "720"
+        payload["audioFormat"] = "mp3"
+
     try:
-        resp = requests.post(
-            "https://dl.siputzx.my.id/",
-            headers=_build_dl_headers(),
-            json={
-                "url": link,
-                "videoQuality": "1080",
-                "downloadMode": "auto"
-            },
-            timeout=30
-        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post("https://dl.siputzx.my.id/", headers=headers, json=payload)
         if resp.status_code != 200:
             return None, f"HTTP {resp.status_code}"
-        data = resp.json()
-        return data, None
+        return resp.json(), None
     except Exception as e:
         return None, str(e)
 
-async def download_to_bytes(session: aiohttp.ClientSession, url: str, max_bytes: int) -> Tuple[Optional[bytes], bool]:
+
+def _headers_for_url(url: str) -> dict:
+    """Atur Referer dinamis biar nggak 403"""
+    ref = "https://dl.siputzx.my.id/"
+    if "instagram" in url or "cdninstagram" in url:
+        ref = "https://www.instagram.com/"
+    elif "tiktok" in url or "tiktokcdn" in url:
+        ref = "https://www.tiktok.com/"
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/127.0.0.1 Safari/537.36",
+        "Referer": ref,
+        "Accept": "*/*"
+    }
+
+
+async def download_bytes(url: str, max_bytes: int = 25_000_000) -> tuple[bytes | None, bool]:
+    """Unduh media dengan header aman"""
     try:
-        async with session.get(url, headers=_build_dl_headers(), timeout=aiohttp.ClientTimeout(total=60)) as r:
-            if r.status != 200:
-                print("[download] status:", r.status)
-                return None, True
-            total = 0
-            buff = io.BytesIO()
-            async for chunk in r.content.iter_chunked(128 * 1024):
-                total += len(chunk)
-                if total > max_bytes:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_headers_for_url(url), timeout=aiohttp.ClientTimeout(total=90)) as r:
+                if r.status != 200:
+                    print(f"[download] {r.status} {url[:80]}")
                     return None, True
-                buff.write(chunk)
-            return buff.getvalue(), False
-    except asyncio.TimeoutError:
-        print("[download] timeout")
-        return None, True
+                total = 0
+                buff = io.BytesIO()
+                async for chunk in r.content.iter_chunked(256 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return None, True
+                    buff.write(chunk)
+                return buff.getvalue(), False
     except Exception as e:
-        print("[download] exception:", e)
+        print("[download] error:", e)
         return None, True
 
-async def _send_file_or_link(thread: discord.Thread, author: discord.Member, url: str, filename: str):
-    async with aiohttp.ClientSession() as session:
-        content, oversize_or_fail = await download_to_bytes(session, url, MAX_UPLOAD_BYTES)
-    if oversize_or_fail or not content:
-        await thread.send(
-            f"⚠️ Ukuran file besar / unduh langsung gagal. Ini tautannya:\n{url}",
-            view=DlActionView(thread, author.id)
-        )
+
+async def send_media_or_link(thread: discord.Thread, author: discord.Member, url: str, filename: str):
+    content, fail = await download_bytes(url)
+    if fail or not content:
+        await thread.send(f"⚠️ File terlalu besar atau gagal unduh.\n🔗 {url}", view=DlActionView(thread, author.id))
         return
-    file = discord.File(io.BytesIO(content), filename=filename or "media.bin")
-    await thread.send(content=f"Media untuk {author.mention}", file=file, view=DlActionView(thread, author.id))
+    file = discord.File(io.BytesIO(content), filename)
+    await thread.send(content=f"📦 Media untuk {author.mention}", file=file, view=DlActionView(thread, author.id))
+
 
 async def process_download_in_thread(thread: discord.Thread, author: discord.Member, link: str):
-    await thread.send("⏳ Tunggu sebentar, aku ambil medianya…")
+    await thread.send("⏳ Sedang mengambil media dari tautan...")
 
-    data, err = _post_siputzx(link)
+    data, err = await post_siputzx(link)
     if not data:
-        await thread.send(f"❌ Gagal mengambil media: {err or 'unknown error'}", view=DlActionView(thread, author.id))
+        await thread.send(f"❌ Gagal ambil data: {err}", view=DlActionView(thread, author.id))
         return
 
-    status = str(data.get("status", "")).lower()
+    status = data.get("status", "")
+    filename = data.get("filename", "media.mp4")
+    url = data.get("url")
 
-    # 1) Instagram carousel / picker
-    if status == "picker" and isinstance(data.get("picker"), list) and data["picker"]:
-        items = data["picker"]
-        # Kirim semua foto. Batasi agar tidak berlebihan (misal 15)
-        limit = min(len(items), 15)
-        sent_any = False
-        for i, it in enumerate(items[:limit], start=1):
-            mtype = it.get("type")
-            url = it.get("url") or it.get("thumb")
-            if not url:
+    # CASE 1 - Carousel Instagram
+    if status == "picker" and isinstance(data.get("picker"), list):
+        for i, item in enumerate(data["picker"], start=1):
+            img_url = item.get("thumb") or item.get("url")
+            if not img_url:
                 continue
-            fname = f"ig_photo_{i:02d}.jpg" if mtype == "photo" else f"ig_item_{i:02d}.bin"
-            await _send_file_or_link(thread, author, url, fname)
-            sent_any = True
-        if not sent_any:
-            await thread.send("❌ Tidak ada item yang bisa diunduh dari carousel itu.", view=DlActionView(thread, author.id))
-        else:
-            await thread.send("✅ Carousel selesai dikirim.", view=DlActionView(thread, author.id))
+            fname = f"ig_item_{i:02d}.jpg"
+            await send_media_or_link(thread, author, img_url, fname)
+        await thread.send("✅ Semua media dari carousel sudah dikirim.", view=DlActionView(thread, author.id))
         return
 
-    # 2) Tunnel file standar (video, dll.)
-    tunnel = data.get("url")
-    filename = data.get("filename") or "media.mp4"
-    if isinstance(tunnel, str) and tunnel.startswith("http"):
-        await _send_file_or_link(thread, author, tunnel, filename)
+    # CASE 2 - TikTok atau Instagram Feed / Reels
+    if url:
+        await send_media_or_link(thread, author, url, filename)
         return
 
-    # 3) Fallback info lain (mis. struktur lain dari API)
-    # Coba cari key yang terlihat seperti direct url
-    for k in ("play", "hdplay", "wmplay", "download", "source"):
-        v = data.get(k)
-        if isinstance(v, str) and v.startswith("http"):
-            await _send_file_or_link(thread, author, v, filename)
-            return
+    await thread.send("❌ Tidak menemukan media yang bisa diunduh.", view=DlActionView(thread, author.id))
 
-    await thread.send("❌ Tidak menemukan media pada tautan tersebut.", view=DlActionView(thread, author.id))
 # =========================
 # SATU-SATUNYA on_message
 # =========================
